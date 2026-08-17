@@ -3,7 +3,7 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execFile, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
@@ -115,6 +115,41 @@ export function wakeContainer(session: Session): Promise<boolean> {
   return promise;
 }
 
+/**
+ * Basenames of the CA cert files @onecli-sh/sdk's `applyContainerConfig`
+ * bind-mounts into the container (see its src/container/ca.ts).
+ */
+const ONECLI_CA_CERT_BASENAMES = new Set(['onecli-proxy-ca.pem', 'onecli-combined-ca.pem']);
+
+/**
+ * Strips OneCLI's CA-cert `-v` bind mounts out of `args` (mutating it) and
+ * returns their host/container paths.
+ *
+ * On this host's Docker runtime (colima + virtiofs), Bun's TLS cert loader
+ * silently fails to parse these files when they're bind-mounted in from the
+ * Mac host — `openssl`/`cat` read them fine, but Bun logs "ignoring extra
+ * certs ... load failed" and every HTTPS request through the OneCLI proxy
+ * then fails with "self signed certificate in certificate chain". Writing
+ * the identical bytes into the container's own filesystem (not bind-mounted)
+ * works, so the caller `docker cp`s them in after `docker create` instead of
+ * bind-mounting. Other bind-mounted files (session DBs, source) are
+ * unaffected — this is specific to Bun's cert-loading path.
+ */
+function extractCaCertMounts(args: string[]): Array<{ hostPath: string; containerPath: string }> {
+  const extracted: Array<{ hostPath: string; containerPath: string }> = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== '-v') continue;
+    const spec = args[i + 1];
+    if (!spec) continue;
+    const [hostPath, containerPath] = spec.split(':');
+    if (!hostPath || !containerPath || !ONECLI_CA_CERT_BASENAMES.has(path.basename(hostPath))) continue;
+    extracted.push({ hostPath, containerPath });
+    args.splice(i, 2);
+    i -= 1;
+  }
+  return extracted;
+}
+
 async function spawnContainer(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
@@ -171,7 +206,30 @@ async function spawnContainer(session: Session): Promise<void> {
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // See extractCaCertMounts: on this host's Docker runtime, Bun can't read
+  // OneCLI's CA cert via a host bind mount, so those go in via `docker cp`
+  // into a `create`d-but-not-yet-`start`ed container instead of `docker run`.
+  const caCertMounts = extractCaCertMounts(args);
+  let container: ChildProcess;
+  if (caCertMounts.length > 0) {
+    args[0] = 'create';
+    let containerId: string | undefined;
+    try {
+      const { stdout } = await execFileAsync(CONTAINER_RUNTIME_BIN, args);
+      containerId = stdout.trim();
+      for (const { hostPath, containerPath } of caCertMounts) {
+        await execFileAsync(CONTAINER_RUNTIME_BIN, ['cp', hostPath, `${containerId}:${containerPath}`]);
+      }
+    } catch (err) {
+      if (containerId) {
+        await execFileAsync(CONTAINER_RUNTIME_BIN, ['rm', '-f', containerId]).catch(() => {});
+      }
+      throw err;
+    }
+    container = spawn(CONTAINER_RUNTIME_BIN, ['start', '-a', containerId], { stdio: ['ignore', 'pipe', 'pipe'] });
+  } else {
+    container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  }
 
   activeContainers.set(session.id, { process: container, containerName, startedAtMs: Date.now() });
   markContainerRunning(session.id);
@@ -558,6 +616,7 @@ async function buildContainerArgs(
 }
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
