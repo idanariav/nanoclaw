@@ -95,17 +95,22 @@ server.tool(
 
 server.tool(
   'gmail_save_attachment_to_drive',
-  'Save an email attachment directly to Drive without ever opening/reading its content. The attachment bytes never pass through you — this downloads and re-uploads server-side and returns only the resulting Drive file id/link.',
+  'Save an email attachment directly to Drive without ever opening/reading its content. The attachment bytes never pass through you — this downloads and re-uploads server-side and returns only the resulting Drive file id/link. Pass `filename` to rename the file on save (e.g. per a naming convention) — give it without an extension; the original file extension is kept automatically.',
   {
     emailId: z.string().describe('The email id (from gmail_search_emails or gmail_read_email)'),
     attachmentId: z.string().describe('The attachment id (from gmail_read_email\'s attachments list)'),
+    filename: z.string().optional().describe('Optional new filename (without extension) to save the file as, instead of its original name'),
   },
   async (args) => {
     log(`Saving attachment ${args.attachmentId} from email ${args.emailId} to Drive`);
     try {
       const res = await sanitizerFetch(
         `/emails/${encodeURIComponent(args.emailId)}/attachments/${encodeURIComponent(args.attachmentId)}/save-to-drive`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: args.filename }),
+        },
       );
       if (!res.ok) {
         return {
@@ -131,9 +136,10 @@ server.tool(
 
 server.tool(
   'gmail_save_url_to_drive',
-  'Save a file from a URL directly to Drive — for cases like an invoice-download link found in an email body, which is not a real Gmail attachment. The URL is fetched and uploaded server-side; you never see its content, only the resulting filename/size/Drive link. Only public https:// URLs are allowed.',
+  'Save a file from a URL directly to Drive — for cases like an invoice-download link found in an email body, which is not a real Gmail attachment. The URL is fetched and uploaded server-side; you never see its content, only the resulting filename/size/Drive link. Only public https:// URLs are allowed. Pass `filename` to rename the file on save (e.g. per a naming convention) — give it without an extension; the original file extension is kept automatically.',
   {
     url: z.string().describe('The https:// URL to download and save to Drive'),
+    filename: z.string().optional().describe('Optional new filename (without extension) to save the file as, instead of the name inferred from the URL'),
   },
   async (args) => {
     log(`Saving URL to Drive: ${args.url}`);
@@ -141,7 +147,7 @@ server.tool(
       const res = await sanitizerFetch('/save-url-to-drive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: args.url }),
+        body: JSON.stringify({ url: args.url, filename: args.filename }),
       });
       if (!res.ok) {
         return {

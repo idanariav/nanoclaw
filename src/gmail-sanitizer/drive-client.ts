@@ -55,6 +55,14 @@ export interface DriveUploadResult {
   size: number;
 }
 
+/** Applies a caller-supplied rename, preserving the original file extension. */
+export function applyFilenameOverride(originalFilename: string, override?: string): string {
+  if (!override) return originalFilename;
+  const dot = originalFilename.lastIndexOf('.');
+  const ext = dot > 0 ? originalFilename.slice(dot) : '';
+  return ext && !override.toLowerCase().endsWith(ext.toLowerCase()) ? `${override}${ext}` : override;
+}
+
 export async function uploadAttachmentToDrive(
   filename: string,
   mimeType: string,

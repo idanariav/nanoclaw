@@ -11,7 +11,7 @@
 import http from 'http';
 
 import { archiveAndLabel, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
-import { uploadAttachmentToDrive } from './drive-client.js';
+import { applyFilenameOverride, uploadAttachmentToDrive } from './drive-client.js';
 import { fetchUrlToBuffer } from './url-fetch.js';
 import { redactHtml, redactText } from './redact.js';
 import { readEnvFile } from '../env.js';
@@ -75,15 +75,22 @@ async function handleGetEmail(id: string, res: http.ServerResponse): Promise<voi
   });
 }
 
-async function handleSaveAttachment(messageId: string, attachmentId: string, res: http.ServerResponse): Promise<void> {
+async function handleSaveAttachment(
+  messageId: string,
+  attachmentId: string,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
   const email = await getEmail(messageId);
   const attachment = email.attachments.find((a) => a.attachmentId === attachmentId);
   if (!attachment) {
     sendJson(res, 404, { error: `Attachment ${attachmentId} not found on message ${messageId}` });
     return;
   }
+  const body = (await readJsonBody(req)) as { filename?: string };
+  const filename = applyFilenameOverride(attachment.filename, body.filename);
   const bytes = await getAttachmentBytes(messageId, attachmentId);
-  const result = await uploadAttachmentToDrive(attachment.filename, attachment.mimeType, bytes);
+  const result = await uploadAttachmentToDrive(filename, attachment.mimeType, bytes);
   sendJson(res, 200, result);
 }
 
@@ -95,13 +102,14 @@ async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
 }
 
 async function handleSaveUrlToDrive(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const body = (await readJsonBody(req)) as { url?: string };
+  const body = (await readJsonBody(req)) as { url?: string; filename?: string };
   if (!body.url) {
     sendJson(res, 400, { error: 'url is required' });
     return;
   }
   const fetched = await fetchUrlToBuffer(body.url);
-  const result = await uploadAttachmentToDrive(fetched.filename, fetched.mimeType, fetched.bytes);
+  const filename = applyFilenameOverride(fetched.filename, body.filename);
+  const result = await uploadAttachmentToDrive(filename, fetched.mimeType, fetched.bytes);
   sendJson(res, 200, result);
 }
 
@@ -142,7 +150,7 @@ const server = http.createServer(async (req, res) => {
 
     const saveMatch = url.pathname.match(/^\/emails\/([^/]+)\/attachments\/([^/]+)\/save-to-drive$/);
     if (req.method === 'POST' && saveMatch) {
-      await handleSaveAttachment(decodeURIComponent(saveMatch[1]), decodeURIComponent(saveMatch[2]), res);
+      await handleSaveAttachment(decodeURIComponent(saveMatch[1]), decodeURIComponent(saveMatch[2]), req, res);
       return;
     }
 
