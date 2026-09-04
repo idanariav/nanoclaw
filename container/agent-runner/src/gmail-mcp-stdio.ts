@@ -208,5 +208,54 @@ server.tool(
   },
 );
 
+server.tool(
+  'gmail_create_draft',
+  'Create a Gmail draft — this NEVER sends anything, it only saves to Drafts for the user to review and send themselves. Pass `emailId` (from gmail_search_emails or gmail_read_email) to thread the draft as a reply under that email\'s thread; omit it for a standalone new draft.',
+  {
+    to: z.string().describe('Recipient address(es), comma-separated for multiple'),
+    cc: z.string().optional().describe('Cc address(es), comma-separated'),
+    subject: z.string().describe('Subject line (Hebrew supported)'),
+    body: z.string().describe('Plain-text body (Hebrew supported)'),
+    emailId: z
+      .string()
+      .optional()
+      .describe('The email id to thread this draft as a reply under (from gmail_search_emails or gmail_read_email)'),
+  },
+  async (args) => {
+    log(`Creating draft to ${args.to}${args.emailId ? ` (reply to ${args.emailId})` : ''}`);
+    try {
+      const res = await sanitizerFetch('/drafts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: args.to,
+          cc: args.cc,
+          subject: args.subject,
+          body: args.body,
+          emailId: args.emailId,
+        }),
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

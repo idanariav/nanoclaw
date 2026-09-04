@@ -71,6 +71,7 @@ export interface RawEmail {
   bodyText: string;
   bodyHtml: string;
   attachments: RawAttachmentMeta[];
+  messageIdHeader: string;
 }
 
 function header(headers: GmailHeader[] | undefined, name: string): string {
@@ -143,6 +144,7 @@ export async function getEmail(id: string): Promise<RawEmail> {
     bodyText: acc.text ?? '',
     bodyHtml: acc.html ?? '',
     attachments: acc.attachments,
+    messageIdHeader: header(headers, 'Message-ID'),
   };
 }
 
@@ -170,4 +172,62 @@ export async function archiveAndLabel(messageId: string, labelName: string): Pro
     method: 'POST',
     body: { removeLabelIds: ['UNREAD', 'INBOX'], addLabelIds: [labelId] },
   });
+}
+
+/** RFC 2047 encoded-word, needed for a non-ASCII (e.g. Hebrew) subject line. */
+function encodeSubjectHeader(subject: string): string {
+  if (/^[\x00-\x7F]*$/.test(subject)) return subject;
+  return `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
+}
+
+function buildRawMessage(opts: { to: string; cc?: string; subject: string; body: string; inReplyTo?: string }): string {
+  const headers = [
+    `To: ${opts.to}`,
+    ...(opts.cc ? [`Cc: ${opts.cc}`] : []),
+    `Subject: ${encodeSubjectHeader(opts.subject)}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
+  ];
+  if (opts.inReplyTo) {
+    headers.push(`In-Reply-To: ${opts.inReplyTo}`, `References: ${opts.inReplyTo}`);
+  }
+  const encodedBody = Buffer.from(opts.body, 'utf8')
+    .toString('base64')
+    .replace(/(.{76})/g, '$1\r\n');
+  const message = `${headers.join('\r\n')}\r\n\r\n${encodedBody}`;
+  return Buffer.from(message, 'utf8').toString('base64url');
+}
+
+export interface DraftResult {
+  draftId: string;
+  messageId: string;
+  threadId: string;
+}
+
+/**
+ * Create a Gmail draft — never sends. Pass `emailId` to thread it as a reply
+ * under an existing message (sets threadId + In-Reply-To/References from that
+ * message), or omit it for a standalone draft.
+ */
+export async function createDraft(opts: {
+  to: string;
+  cc?: string;
+  subject: string;
+  body: string;
+  emailId?: string;
+}): Promise<DraftResult> {
+  let threadId: string | undefined;
+  let inReplyTo: string | undefined;
+  if (opts.emailId) {
+    const original = await getEmail(opts.emailId);
+    threadId = original.threadId;
+    inReplyTo = original.messageIdHeader || undefined;
+  }
+  const raw = buildRawMessage({ to: opts.to, cc: opts.cc, subject: opts.subject, body: opts.body, inReplyTo });
+  const created = (await gmailFetch('/drafts', {
+    method: 'POST',
+    body: { message: { raw, ...(threadId ? { threadId } : {}) } },
+  })) as { id: string; message: { id: string; threadId: string } };
+  return { draftId: created.id, messageId: created.message.id, threadId: created.message.threadId };
 }

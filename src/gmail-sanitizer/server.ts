@@ -10,7 +10,7 @@
  */
 import http from 'http';
 
-import { archiveAndLabel, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
+import { archiveAndLabel, createDraft, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
 import { applyFilenameOverride, uploadAttachmentToDrive } from './drive-client.js';
 import { fetchUrlToBuffer } from './url-fetch.js';
 import { redactHtml, redactText } from './redact.js';
@@ -113,6 +113,28 @@ async function handleSaveUrlToDrive(req: http.IncomingMessage, res: http.ServerR
   sendJson(res, 200, result);
 }
 
+async function handleCreateDraft(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = (await readJsonBody(req)) as {
+    to?: string;
+    cc?: string;
+    subject?: string;
+    body?: string;
+    emailId?: string;
+  };
+  if (!body.to || !body.subject || !body.body) {
+    sendJson(res, 400, { error: 'to, subject, and body are required' });
+    return;
+  }
+  const result = await createDraft({
+    to: body.to,
+    cc: body.cc,
+    subject: body.subject,
+    body: body.body,
+    emailId: body.emailId,
+  });
+  sendJson(res, 200, result);
+}
+
 async function handleArchiveAndLabel(
   messageId: string,
   req: http.IncomingMessage,
@@ -156,6 +178,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/save-url-to-drive') {
       await handleSaveUrlToDrive(req, res);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/drafts') {
+      await handleCreateDraft(req, res);
       return;
     }
 
