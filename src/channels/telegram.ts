@@ -12,7 +12,7 @@ import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js'
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelRegistration, ChannelSetup, InboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
 
 /**
@@ -124,6 +124,7 @@ function createPairingInterceptor(
   botUsernamePromise: Promise<string | null>,
   hostOnInbound: ChannelSetup['onInbound'],
   token: string,
+  instance: string,
 ): ChannelSetup['onInbound'] {
   return async (platformId, threadId, message) => {
     try {
@@ -152,7 +153,10 @@ function createPairingInterceptor(
       // code-bearing message never reaches an agent. Privilege is now a
       // property of the paired user, not the chat: upsert the user, and if
       // this instance has no owner yet, promote them to owner.
-      const existing = getMessagingGroupByPlatform('telegram', platformId);
+      // `instance` is exact-only here: a DM's platform_id (the operator's own
+      // Telegram user id) is identical across every bot they've paired, so
+      // without it this would collide with a sibling bot's existing row.
+      const existing = getMessagingGroupByPlatform('telegram', platformId, instance);
       if (existing) {
         updateMessagingGroup(existing.id, {
           is_group: consumed.consumed!.isGroup ? 1 : 0,
@@ -162,6 +166,7 @@ function createPairingInterceptor(
           id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           channel_type: 'telegram',
           platform_id: platformId,
+          instance,
           name: consumed.consumed!.name,
           is_group: consumed.consumed!.isGroup ? 1 : 0,
           // Same context-appropriate default as router auto-create, so a
@@ -208,57 +213,83 @@ function createPairingInterceptor(
   };
 }
 
-registerChannelAdapter('telegram', {
-  factory: () => {
-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
-    if (!env.TELEGRAM_BOT_TOKEN) return null;
-    const token = env.TELEGRAM_BOT_TOKEN;
-    const telegramAdapter = createTelegramAdapter({
-      botToken: token,
-      mode: 'polling',
-    });
-    const bridge = createChatSdkBridge({
-      adapter: telegramAdapter,
-      concurrency: 'concurrent',
-      extractReplyContext,
-      supportsThreads: false,
-      defaults: TELEGRAM_DEFAULTS,
-      // No transformOutboundText: @chat-adapter/telegram >= 4.29 parses
-      // CommonMark and renders escaped MarkdownV2 itself. The legacy-Markdown
-      // sanitizer this replaced was written for the old converter and, run in
-      // front of the new one, downgraded **bold** to *single-star* — which the
-      // adapter then parsed as emphasis and rendered as _italic_.
-      maxTextLength: 4000,
-    });
+/**
+ * Builds a registration for one Telegram bot identity. `instance` disambiguates
+ * N bots on this platform (default bot omits it — key defaults to channelType,
+ * matching pre-multi-bot behavior); each reads its own token from a dedicated
+ * env var so multiple bots can run side by side without colliding.
+ */
+function buildTelegramRegistration(tokenEnvVar: string, instance: string | undefined): ChannelRegistration {
+  return {
+    factory: () => {
+      const env = readEnvFile([tokenEnvVar]);
+      if (!env[tokenEnvVar]) return null;
+      const token = env[tokenEnvVar];
+      const telegramAdapter = createTelegramAdapter({
+        botToken: token,
+        mode: 'polling',
+      });
+      const bridge = createChatSdkBridge({
+        adapter: telegramAdapter,
+        // Drives the registry key, the webhook route (/webhook/<instance>),
+        // and the Chat SDK state namespace — without this, a second bridge
+        // of the same platform silently collides with the default instance
+        // on all three (undefined here defaults to adapter.name, same as
+        // the pre-multi-bot single instance).
+        instance,
+        concurrency: 'concurrent',
+        extractReplyContext,
+        supportsThreads: false,
+        defaults: TELEGRAM_DEFAULTS,
+        // No transformOutboundText: @chat-adapter/telegram >= 4.29 parses
+        // CommonMark and renders escaped MarkdownV2 itself. The legacy-Markdown
+        // sanitizer this replaced was written for the old converter and, run in
+        // front of the new one, downgraded **bold** to *single-star* — which the
+        // adapter then parsed as emphasis and rendered as _italic_.
+        maxTextLength: 4000,
+      });
 
-    const botUsernamePromise = fetchBotUsername(token);
+      const botUsernamePromise = fetchBotUsername(token);
 
-    const wrapped: ChannelAdapter = {
-      ...bridge,
-      resolveChannelName: async (platformId: string) => {
-        const chatId = platformId.split(':').slice(1).join(':');
-        if (!chatId) return null;
-        try {
-          const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId }),
-          });
-          const data = (await res.json()) as { ok?: boolean; result?: { title?: string } };
-          return data.ok ? (data.result?.title ?? null) : null;
-        } catch {
-          return null;
-        }
-      },
-      async setup(hostConfig: ChannelSetup) {
-        const intercepted: ChannelSetup = {
-          ...hostConfig,
-          onInbound: createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token),
-        };
-        return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
-      },
-    };
-    return wrapped;
-  },
-  defaults: TELEGRAM_DEFAULTS,
-});
+      const wrapped: ChannelAdapter = {
+        ...bridge,
+        resolveChannelName: async (platformId: string) => {
+          const chatId = platformId.split(':').slice(1).join(':');
+          if (!chatId) return null;
+          try {
+            const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId }),
+            });
+            const data = (await res.json()) as { ok?: boolean; result?: { title?: string } };
+            return data.ok ? (data.result?.title ?? null) : null;
+          } catch {
+            return null;
+          }
+        },
+        async setup(hostConfig: ChannelSetup) {
+          const intercepted: ChannelSetup = {
+            ...hostConfig,
+            onInbound: createPairingInterceptor(
+              botUsernamePromise,
+              hostConfig.onInbound,
+              token,
+              instance ?? 'telegram',
+            ),
+          };
+          return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
+        },
+      };
+      return wrapped;
+    },
+    defaults: TELEGRAM_DEFAULTS,
+  };
+}
+
+registerChannelAdapter('telegram', buildTelegramRegistration('TELEGRAM_BOT_TOKEN', undefined));
+// Second bot identity ("Jarvis"), alongside the default bot. Its own env var
+// (TELEGRAM_BOT_TOKEN_JARVIS) keeps credentials distinct; the 'telegram-jarvis'
+// instance keeps its messaging_groups rows distinct even when it shares a
+// platform_id (the operator's own Telegram user id) with the default bot.
+registerChannelAdapter('telegram-jarvis', buildTelegramRegistration('TELEGRAM_BOT_TOKEN_JARVIS', 'telegram-jarvis'));

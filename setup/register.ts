@@ -57,6 +57,8 @@ interface RegisterArgs {
   engageMode?: 'pattern' | 'mention' | 'mention-sticky';
   /** Explicit unknown_sender_policy override; omitted = channel declaration / 'strict' */
   unknownSenderPolicy?: 'strict' | 'request_approval' | 'decline_notify' | 'public';
+  /** Adapter-instance name, for platforms running N bots/apps of one channel type. Omitted = default instance (= channel). */
+  instance?: string;
 }
 
 const ENGAGE_MODES = ['pattern', 'mention', 'mention-sticky'] as const;
@@ -127,6 +129,9 @@ function parseArgs(args: string[]): RegisterArgs {
         result.unknownSenderPolicy = raw;
         break;
       }
+      case '--instance':
+        result.instance = args[++i] || undefined;
+        break;
     }
   }
 
@@ -206,8 +211,12 @@ export async function run(args: string[]): Promise<void> {
   }
   ensureContainerConfig(agentGroup.id);
 
-  // 2. Create or find messaging group
-  let messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId);
+  // 2. Create or find messaging group. `instance` is exact-only: with no
+  // instance given this resolves default-instance-first, which would silently
+  // hand back a sibling bot's row when two adapter instances of one channel
+  // type share a platform_id (e.g. an operator's own Telegram user id is the
+  // same across every bot they've paired).
+  let messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId, parsed.instance);
   if (!messagingGroup) {
     const mgId = generateId('mg');
     // Policy: explicit flag → channel declaration → legacy 'strict' (stale
@@ -221,12 +230,13 @@ export async function run(args: string[]): Promise<void> {
       id: mgId,
       channel_type: parsed.channel,
       platform_id: parsed.platformId,
+      instance: parsed.instance,
       name: parsed.name,
       is_group: parsed.isGroup ? 1 : 0,
       unknown_sender_policy: unknownSenderPolicy,
       created_at: new Date().toISOString(),
     });
-    messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId)!;
+    messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId, parsed.instance)!;
     log.info('Created messaging group', { id: mgId, channel: parsed.channel, platformId: parsed.platformId });
   }
 
