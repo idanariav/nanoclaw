@@ -24,6 +24,9 @@
  * adapter barrel) — trunk ships none.
  */
 
+import { registerSlackAutoProvision } from './slack-auto-register.js';
+import { registerTelegramPreStep } from './telegram-pre-step.js';
+
 /**
  * A channel's auto-provision pre-step. `agentName` is the operator's resolved
  * assistant name. Resolves to the skill inputs to pre-bind, or undefined for
@@ -56,3 +59,8 @@ export function getCompanionSkills(channel: string): readonly string[] {
 }
 
 // ── Feature self-registration imports (appended by channel install skills) ──
+
+// Registrations shipped with trunk. The register function is passed in
+// (rather than the shim importing it) so each shim stays cycle-free.
+registerSlackAutoProvision(registerChannelPreStep, registerCompanionSkills);
+registerTelegramPreStep(registerChannelPreStep);

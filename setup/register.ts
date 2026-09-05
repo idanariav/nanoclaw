@@ -17,7 +17,7 @@ import {
   validateEngageAgainstChannel,
 } from '../src/channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../src/channels/channel-registry.js';
-import { DATA_DIR } from '../src/config.js';
+import { CENTRAL_DB_PATH } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
@@ -30,6 +30,7 @@ import {
 } from '../src/db/messaging-groups.js';
 import { isValidGroupFolder } from '../src/group-folder.js';
 import { log } from '../src/log.js';
+import '../src/mailbox/compose.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
 import { resolveSession, writeSessionMessage } from '../src/session-manager.js';
 import { emitStatus } from './status.js';
@@ -122,9 +123,7 @@ function parseArgs(args: string[]): RegisterArgs {
       case '--unknown-sender-policy': {
         const raw = (args[++i] || '').toLowerCase() as RegisterArgs['unknownSenderPolicy'];
         if (!raw || !SENDER_POLICIES.includes(raw)) {
-          throw new Error(
-            `--unknown-sender-policy must be one of ${SENDER_POLICIES.join('|')}, got "${raw}"`,
-          );
+          throw new Error(`--unknown-sender-policy must be one of ${SENDER_POLICIES.join('|')}, got "${raw}"`);
         }
         result.unknownSenderPolicy = raw;
         break;
@@ -186,9 +185,8 @@ export async function run(args: string[]): Promise<void> {
 
   // Init v2 central DB
   fs.mkdirSync(path.join(projectRoot, 'data'), { recursive: true });
-  const dbPath = path.join(DATA_DIR, 'v2.db');
-  const db = initDb(dbPath);
-  runMigrations(db);
+  const db = await initDb(CENTRAL_DB_PATH);
+  await runMigrations(db);
 
   // 1. Create or find agent group. The workspace is scaffolded at the first
   // spawn (group-init), where the DB-resolved provider is known; here we only
@@ -196,27 +194,27 @@ export async function run(args: string[]): Promise<void> {
   // channel group is created on the operator's chosen provider (per-group
   // `ncl groups config update --provider` still overrides). A reused group
   // keeps its existing provider (INSERT OR IGNORE).
-  let agentGroup = getAgentGroupByFolder(parsed.folder);
+  let agentGroup = await getAgentGroupByFolder(parsed.folder);
   if (!agentGroup) {
     const agId = generateId('ag');
-    createAgentGroup({
+    await createAgentGroup({
       id: agId,
       name: parsed.assistantName,
       folder: parsed.folder,
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    agentGroup = getAgentGroupByFolder(parsed.folder)!;
+    agentGroup = (await getAgentGroupByFolder(parsed.folder))!;
     log.info('Created agent group', { id: agId, folder: parsed.folder });
   }
-  ensureContainerConfig(agentGroup.id);
+  await ensureContainerConfig(agentGroup.id);
 
   // 2. Create or find messaging group. `instance` is exact-only: with no
   // instance given this resolves default-instance-first, which would silently
   // hand back a sibling bot's row when two adapter instances of one channel
   // type share a platform_id (e.g. an operator's own Telegram user id is the
   // same across every bot they've paired).
-  let messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId, parsed.instance);
+  let messagingGroup = await getMessagingGroupByPlatform(parsed.channel, parsed.platformId, parsed.instance);
   if (!messagingGroup) {
     const mgId = generateId('mg');
     // Policy: explicit flag → channel declaration → legacy 'strict' (stale
@@ -226,7 +224,7 @@ export async function run(args: string[]): Promise<void> {
       (hasDeclaredChannelDefaults(parsed.channel)
         ? resolveUnknownSenderPolicy(parsed.channel, parsed.isGroup)
         : 'strict');
-    createMessagingGroup({
+    await createMessagingGroup({
       id: mgId,
       channel_type: parsed.channel,
       platform_id: parsed.platformId,
@@ -236,14 +234,14 @@ export async function run(args: string[]): Promise<void> {
       unknown_sender_policy: unknownSenderPolicy,
       created_at: new Date().toISOString(),
     });
-    messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId, parsed.instance)!;
+    messagingGroup = (await getMessagingGroupByPlatform(parsed.channel, parsed.platformId, parsed.instance))!;
     log.info('Created messaging group', { id: mgId, channel: parsed.channel, platformId: parsed.platformId });
   }
 
   // 3. Wire agent to messaging group — createMessagingGroupAgent auto-creates
   // the companion agent_destinations row so delivery's ACL admits this target.
   let newlyWired = false;
-  const existing = getMessagingGroupAgentByPair(messagingGroup.id, agentGroup.id);
+  const existing = await getMessagingGroupAgentByPair(messagingGroup.id, agentGroup.id);
   if (!existing) {
     newlyWired = true;
     const mgaId = generateId('mga');
@@ -276,7 +274,7 @@ export async function run(args: string[]): Promise<void> {
     // channels declaring mentions:'never'; coerces mention-sticky→mention
     // when the channel context has no thread ids.
     validateEngageAgainstChannel(engage, messagingGroup);
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: mgaId,
       messaging_group_id: messagingGroup.id,
       agent_group_id: agentGroup.id,
@@ -297,13 +295,13 @@ export async function run(args: string[]): Promise<void> {
 
   // 4. Send onboarding message — only on first wiring, not re-registration
   if (newlyWired) {
-    const { session } = resolveSession(
+    const { session } = await resolveSession(
       agentGroup.id,
       messagingGroup.id,
       null,
       parsed.sessionMode as 'shared' | 'per-thread' | 'agent-shared',
     );
-    writeSessionMessage(agentGroup.id, session.id, {
+    await writeSessionMessage(agentGroup.id, session.id, {
       id: generateId('onboard'),
       kind: 'task',
       timestamp: new Date().toISOString(),
