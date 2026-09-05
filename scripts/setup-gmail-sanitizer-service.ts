@@ -9,7 +9,7 @@
  * Usage: pnpm exec tsx scripts/setup-gmail-sanitizer-service.ts
  *
  * Generates GMAIL_SANITIZER_TOKEN into .env if not already present (the
- * shared secret Elric's container uses to authenticate to this service —
+ * shared secret the agent's container uses to authenticate to this service —
  * NOT a Gmail/Drive credential, which never leaves this process).
  */
 import { execSync } from 'child_process';
