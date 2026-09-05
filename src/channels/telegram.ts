@@ -288,8 +288,8 @@ function buildTelegramRegistration(tokenEnvVar: string, instance: string | undef
 }
 
 registerChannelAdapter('telegram', buildTelegramRegistration('TELEGRAM_BOT_TOKEN', undefined));
-// Second bot identity ("Jarvis"), alongside the default bot. Its own env var
-// (TELEGRAM_BOT_TOKEN_JARVIS) keeps credentials distinct; the 'telegram-jarvis'
+// Second bot identity ("Elric"), alongside the default bot. Its own env var
+// (TELEGRAM_BOT_TOKEN_ELRIC) keeps credentials distinct; the 'telegram-elric'
 // instance keeps its messaging_groups rows distinct even when it shares a
 // platform_id (the operator's own Telegram user id) with the default bot.
-registerChannelAdapter('telegram-jarvis', buildTelegramRegistration('TELEGRAM_BOT_TOKEN_JARVIS', 'telegram-jarvis'));
+registerChannelAdapter('telegram-elric', buildTelegramRegistration('TELEGRAM_BOT_TOKEN_ELRIC', 'telegram-elric'));
