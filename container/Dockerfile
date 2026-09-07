@@ -22,6 +22,9 @@ ARG INSTALL_CJK_FONTS=false
 # pinned in cli-tools.json so a skill can add one with a json-merge; Bun (the
 # runtime) is pinned here because it installs from a different source.
 ARG BUN_VERSION=1.4.0
+# mq (github.com/harehare/mq) has no npm/pnpm distribution — pinned separately
+# from a GitHub release binary, same reproducibility contract as Bun above.
+ARG MQ_VERSION=0.8.4
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -69,6 +72,27 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun && \
     rm -rf /root/.bun
 
+# ---- mq ------------------------------------------------------------------------
+# jq-like CLI for Markdown (github.com/harehare/mq) — some Obsidian-vault
+# skills reach for it as a structural-parsing fallback. Downloads the pinned
+# release's prebuilt binary for the image's own architecture, verified
+# against that release's published checksums.txt before install.
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        arm64) mq_target=aarch64-unknown-linux-gnu ;; \
+        amd64) mq_target=x86_64-unknown-linux-gnu ;; \
+        *) echo "unsupported arch for mq: $arch" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/harehare/mq/releases/download/v${MQ_VERSION}"; \
+    curl -fsSL -o /tmp/mq-bin "${base}/mq-${mq_target}"; \
+    curl -fsSL -o /tmp/mq-checksums.txt "${base}/checksums.txt"; \
+    expected="$(awk -v f="mq-${mq_target}/mq-${mq_target}" '$2==f {print $1}' /tmp/mq-checksums.txt)"; \
+    [ -n "$expected" ]; \
+    echo "${expected}  /tmp/mq-bin" | sha256sum -c -; \
+    install -m 0755 /tmp/mq-bin /usr/local/bin/mq; \
+    rm -f /tmp/mq-bin /tmp/mq-checksums.txt
+
 # ---- agent-runner deps -------------------------------------------------------
 # Deps are cached independently of CLI versions. Source is NOT baked in —
 # it's provided by the shared RO mount at runtime.
@@ -112,6 +136,45 @@ RUN npm install -g npm@${NPM_VERSION}
 COPY cli-tools.json install-cli-tools.sh /tmp/
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     sh /tmp/install-cli-tools.sh /tmp/cli-tools.json
+
+# Some globally-installed CLIs (e.g. qimg, via @huggingface/transformers) write
+# a runtime cache inside their own installed package directory instead of
+# respecting XDG_CACHE_HOME — fine for a per-user install, but this tree is
+# root-owned and read-only to the non-root `node` user the agent runs as.
+# Matches the /home/node precedent below: any uid must be able to write here.
+RUN chmod -R 777 "$PNPM_HOME"
+
+# ---- qmd/qnode/qimg/qvoid state wrappers -------------------------------------
+# These four default to $HOME/.config, $HOME/.cache, $HOME/.local/share, which
+# are ephemeral per container. Wrap them to redirect state into a group's
+# "tool-state" additional mount when one is wired up (falls back to an
+# ephemeral dir under /workspace/extra otherwise — still functional for the
+# session, just not persisted). qmd additionally picks up pre-downloaded model
+# weights from a "qmd-models" mount, matched by the substring in qmd's own
+# DEFAULT_*_MODEL constants rather than an exact filename, so it survives the
+# operator re-pulling a different quantization on the host.
+RUN mkdir -p /usr/local/qtool-wrappers && \
+    for tool in qmd qnode qimg qvoid; do \
+      { \
+        printf '#!/bin/sh\n'; \
+        printf 'export XDG_CONFIG_HOME=/workspace/extra/tool-state/config\n'; \
+        printf 'export XDG_CACHE_HOME=/workspace/extra/tool-state/cache\n'; \
+        printf 'export XDG_DATA_HOME=/workspace/extra/tool-state/data\n'; \
+        if [ "$tool" = "qmd" ]; then \
+          printf 'if [ -d /workspace/extra/qmd-models ]; then\n'; \
+          printf '  embed=$(ls /workspace/extra/qmd-models/*embeddinggemma* 2>/dev/null | head -1)\n'; \
+          printf '  rerank=$(ls /workspace/extra/qmd-models/*reranker* 2>/dev/null | head -1)\n'; \
+          printf '  generate=$(ls /workspace/extra/qmd-models/*query-expansion* 2>/dev/null | head -1)\n'; \
+          printf '  [ -n "$embed" ] && export QMD_EMBED_MODEL="$embed"\n'; \
+          printf '  [ -n "$rerank" ] && export QMD_RERANK_MODEL="$rerank"\n'; \
+          printf '  [ -n "$generate" ] && export QMD_GENERATE_MODEL="$generate"\n'; \
+          printf 'fi\n'; \
+        fi; \
+        printf 'exec "$PNPM_HOME/%s" "$@"\n' "$tool"; \
+      } > "/usr/local/qtool-wrappers/$tool" && \
+      chmod +x "/usr/local/qtool-wrappers/$tool"; \
+    done
+ENV PATH="/usr/local/qtool-wrappers:$PATH"
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
