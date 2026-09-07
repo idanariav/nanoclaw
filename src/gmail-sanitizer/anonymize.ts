@@ -78,9 +78,9 @@ function isValidIsraeliId(idDigits: string): boolean {
   return sum % 10 === 0;
 }
 
-type PiiType = 'PHONE' | 'BANK_ACCOUNT' | 'ID';
+type PiiType = 'PHONE' | 'BANK_ACCOUNT' | 'ID' | 'CELL';
 
-const TOKEN_RE = /\[(?:PHONE|BANK_ACCOUNT|ID)_\d+\]/g;
+const TOKEN_RE = /\[(?:PHONE|BANK_ACCOUNT|ID|CELL)_\d+\]/g;
 
 // Entries older than this are dropped — both on load and on a periodic
 // sweep — so the store can't grow forever on a long-running process.
@@ -111,7 +111,7 @@ interface Entry {
 export class AnonymizationStore {
   private byKey = new Map<string, Entry>();
   private byToken = new Map<string, Entry>();
-  private counters: Record<PiiType, number> = { PHONE: 0, BANK_ACCOUNT: 0, ID: 0 };
+  private counters: Record<PiiType, number> = { PHONE: 0, BANK_ACCOUNT: 0, ID: 0, CELL: 0 };
   private readonly persistPath?: string;
 
   constructor(persistPath?: string) {
@@ -123,7 +123,13 @@ export class AnonymizationStore {
   }
 
   tokenize(type: PiiType, rawValue: string): string {
-    const key = `${type}:${rawValue.replace(/\D/g, '')}`;
+    // Numeric PII (phone/bank/ID) dedupes on digits-only so reformatted
+    // repeats ("052-1234567" vs "0521234567") collapse to one token. A
+    // non-numeric value (e.g. a spreadsheet cell holding a name) has no
+    // digits to key on — fall back to the trimmed, case-normalized value
+    // itself so distinct text values don't all collide on the same key.
+    const digits = rawValue.replace(/\D/g, '');
+    const key = digits ? `${type}:${digits}` : `${type}:text:${rawValue.trim().toLowerCase()}`;
     const existing = this.byKey.get(key);
     if (existing) return existing.token;
 
@@ -246,4 +252,15 @@ export function anonymizeHtml(html: string, store: AnonymizationStore = defaultS
 export function deanonymizeText(text: string, store: AnonymizationStore = defaultStore): string {
   if (!text) return text;
   return store.detokenize(text);
+}
+
+/**
+ * Tokenize a single spreadsheet cell value that a report's column allowlist
+ * (excel-reports.ts) has marked sensitive — no content detection, the
+ * caller already knows this column is sensitive. Blank values pass through
+ * unchanged since there's nothing to hide.
+ */
+export function anonymizeCellValue(value: string, store: AnonymizationStore = defaultStore): string {
+  if (!value || !value.trim()) return value;
+  return store.tokenize('CELL', value);
 }

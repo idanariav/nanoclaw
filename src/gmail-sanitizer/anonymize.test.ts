@@ -4,7 +4,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { AnonymizationStore, anonymizeHtml, anonymizeText, deanonymizeText } from './anonymize.js';
+import { AnonymizationStore, anonymizeCellValue, anonymizeHtml, anonymizeText, deanonymizeText } from './anonymize.js';
 
 let store: AnonymizationStore;
 
@@ -180,5 +180,33 @@ describe('disk persistence', () => {
     vi.setSystemTime(new Date('2026-01-14T23:59:00Z')); // just under 14 days later
     const after = new AnonymizationStore(storePath);
     expect(deanonymizeText('[PHONE_1]', after)).toBe('052-1234567');
+  });
+});
+
+describe('anonymizeCellValue', () => {
+  it('gives distinct non-numeric values distinct tokens', () => {
+    expect(anonymizeCellValue('Alice', store)).toBe('[CELL_1]');
+    expect(anonymizeCellValue('Bob', store)).toBe('[CELL_2]');
+  });
+
+  it('reuses the same token for a repeated value, including whitespace/case variants', () => {
+    expect(anonymizeCellValue('Alice', store)).toBe('[CELL_1]');
+    expect(anonymizeCellValue('alice', store)).toBe('[CELL_1]');
+    expect(anonymizeCellValue('  Alice  ', store)).toBe('[CELL_1]');
+  });
+
+  it('leaves blank or whitespace-only values untouched', () => {
+    expect(anonymizeCellValue('', store)).toBe('');
+    expect(anonymizeCellValue('   ', store)).toBe('   ');
+  });
+
+  it('round-trips through deanonymizeText', () => {
+    const token = anonymizeCellValue('Account Holder Name', store);
+    expect(deanonymizeText(token, store)).toBe('Account Holder Name');
+  });
+
+  it('still dedupes numeric-looking cell values by digits, like other PII types', () => {
+    expect(anonymizeCellValue('052-1234567', store)).toBe('[CELL_1]');
+    expect(anonymizeCellValue('0521234567', store)).toBe('[CELL_1]');
   });
 });

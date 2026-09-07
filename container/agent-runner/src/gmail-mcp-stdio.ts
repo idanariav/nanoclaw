@@ -260,5 +260,116 @@ server.tool(
   },
 );
 
+server.tool(
+  'gmail_read_excel_attachment',
+  'Read an Excel (.xlsx) attachment from an email, or a file already saved to Drive, as structured row/column data. Provide either (emailId + attachmentId) for a fresh attachment, or driveFileId for a previously-saved one. Columns the report\'s owner has marked sensitive (e.g. account numbers, names) come back as numbered tokens like [CELL_1] — same rule as other PII tokens: the same real value always gets the same token, and you can paste a token into gmail_edit_excel_attachment to write that sensitive value back unchanged without ever seeing it. Only files matching a known, pre-configured report template (an exact sheet name + header row match) can be read — an unrecognized file returns an error naming the sheets/headers it found, rather than exposing unreviewed data; ask the user to add a template for it if that happens. Row numbers in the result are how you address rows in an edit.',
+  {
+    emailId: z.string().optional().describe('The email id (from gmail_search_emails or gmail_read_email)'),
+    attachmentId: z.string().optional().describe('The attachment id (from gmail_read_email\'s attachments list)'),
+    driveFileId: z.string().optional().describe('A Drive file id, for a file already saved to Drive instead of a fresh Gmail attachment'),
+  },
+  async (args) => {
+    log(`Reading Excel attachment${args.attachmentId ? ` ${args.attachmentId}` : ''}${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}`);
+    try {
+      const res = await sanitizerFetch('/excel/read', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emailId: args.emailId, attachmentId: args.attachmentId, driveFileId: args.driveFileId }),
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gmail_edit_excel_attachment',
+  'Apply targeted cell edits and/or append rows to an Excel report previously read with gmail_read_excel_attachment, saving the result as a NEW file in Drive — this never modifies the original attachment and never creates a Gmail draft. Only cell-value changes and row appends are supported: no new columns, no formula or formatting changes, no row/column deletion. Address edits by the row number and column (header name) returned from gmail_read_excel_attachment. If a sheet has a key column, pass `keyColumnValue` with the value you read in that row\'s key column — the edit is verified against the live file and rejected (with nothing written) if the row no longer matches, which catches the file having changed since you read it. If a value you\'re writing is a token like [CELL_1] copied from a read, it resolves to the real value here, server-side — you never need to see or type the real value. Returns the new file\'s Drive id/link; mention it in your reply, it is not attached to anything automatically.',
+  {
+    emailId: z.string().optional().describe('The email id, if editing a fresh Gmail attachment (with attachmentId)'),
+    attachmentId: z.string().optional().describe('The attachment id, if editing a fresh Gmail attachment (with emailId)'),
+    driveFileId: z.string().optional().describe('A Drive file id, if editing a file already saved to Drive'),
+    cellEdits: z
+      .array(
+        z.object({
+          sheetName: z.string().describe('Sheet name, as returned by gmail_read_excel_attachment'),
+          row: z.number().describe('Row number, as returned by gmail_read_excel_attachment'),
+          column: z.string().describe('Column header name'),
+          value: z.string().describe('New value — a plain value, or an anonymization token copied from a read'),
+          keyColumnValue: z
+            .string()
+            .optional()
+            .describe('The value read in this row\'s key column, if the sheet has one — verified before writing'),
+        }),
+      )
+      .optional()
+      .describe('Targeted cell changes to apply'),
+    appendRows: z
+      .array(
+        z.object({
+          sheetName: z.string().describe('Sheet name to append to'),
+          values: z.record(z.string(), z.string()).describe('Column header name -> new value, for every column to fill in'),
+        }),
+      )
+      .optional()
+      .describe('New rows to append after the last row of data'),
+    filename: z
+      .string()
+      .optional()
+      .describe('Filename for the saved file (with or without .xlsx). Defaults to the original attachment\'s filename; required when editing a driveFileId with no known original name.'),
+  },
+  async (args) => {
+    log(`Editing Excel attachment${args.attachmentId ? ` ${args.attachmentId}` : ''}${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}`);
+    try {
+      const res = await sanitizerFetch('/excel/edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          emailId: args.emailId,
+          attachmentId: args.attachmentId,
+          driveFileId: args.driveFileId,
+          cellEdits: args.cellEdits,
+          appendRows: args.appendRows,
+          filename: args.filename,
+        }),
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

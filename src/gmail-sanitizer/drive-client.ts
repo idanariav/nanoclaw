@@ -2,7 +2,9 @@
  * Raw Drive REST access, scoped to `drive.file` (the connected OneCLI app
  * can only see files it created). Uploads go straight from the Gmail
  * attachment bytes to Drive inside this process — callers never see the
- * bytes, only the resulting file metadata.
+ * bytes, only the resulting file metadata. `downloadDriveFileBytes` is the
+ * read-side counterpart (e.g. re-opening a report previously saved here to
+ * edit it) — its bytes stay inside this process too, same as an upload.
  */
 import { fetch } from 'undici';
 
@@ -61,6 +63,12 @@ export function applyFilenameOverride(originalFilename: string, override?: strin
   const dot = originalFilename.lastIndexOf('.');
   const ext = dot > 0 ? originalFilename.slice(dot) : '';
   return ext && !override.toLowerCase().endsWith(ext.toLowerCase()) ? `${override}${ext}` : override;
+}
+
+/** Download an existing Drive file's bytes (e.g. one previously saved via uploadAttachmentToDrive) so it can be re-read or edited. */
+export async function downloadDriveFileBytes(driveFileId: string): Promise<Buffer> {
+  const res = await driveFetch(`${DRIVE_API}/files/${driveFileId}?alt=media`);
+  return Buffer.from(await res.arrayBuffer());
 }
 
 export async function uploadAttachmentToDrive(
