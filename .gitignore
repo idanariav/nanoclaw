@@ -14,9 +14,10 @@ logs/
 # Groups - per-installation state, not tracked
 groups/*
 
-# Personal container skills - install-specific, not shared/trunk-worthy
-# (unlike the generic skills alongside them, e.g. agent-browser, self-customize)
-container/skills/updating-website/
+# Container skills that are install-specific rather than generic/shared
+# (unlike agent-browser, self-customize, etc.) are named with a "local-"
+# prefix and never tracked, same idea as CLAUDE.local.md.
+container/skills/local-*/
 
 # Per-group memory (CLAUDE.local.md) must never be committed.
 **/CLAUDE.local.md
