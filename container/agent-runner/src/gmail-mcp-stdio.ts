@@ -1,9 +1,12 @@
 /**
  * Gmail MCP server for NanoClaw — thin client over the gmail-sanitizer
  * host service (src/gmail-sanitizer/, outside this container). All PII
- * redaction and Gmail/Drive credential handling happen on the other side
- * of this HTTP call; this file never sees a raw Gmail credential and never
- * receives attachment bytes.
+ * anonymization and Gmail/Drive credential handling happen on the other
+ * side of this HTTP call; this file never sees a raw Gmail credential and
+ * never receives attachment bytes. PII values (phone numbers, bank
+ * accounts, ID numbers) never reach this file either — only numbered
+ * tokens like `[PHONE_1]`, which gmail_create_draft resolves back to the
+ * real value server-side.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -28,7 +31,7 @@ const server = new McpServer({ name: 'gmail', version: '1.0.0' });
 
 server.tool(
   'gmail_search_emails',
-  'Search Gmail. Returns redacted subject/snippet — bank account numbers, phone numbers, and ID numbers are already stripped and replaced with tags like [PHONE_REDACTED]. Use standard Gmail search syntax for the query (e.g. "from:someone@example.com", "is:unread", "after:2026/01/01").',
+  'Search Gmail. Returns anonymized subject/snippet — bank account numbers, phone numbers, and ID numbers are replaced with numbered tokens like [PHONE_1]. The same real value always gets the same token, so repeats are recognizable without ever exposing the value to you. To reuse a value (e.g. forwarding a phone number in a reply), copy the token itself into gmail_create_draft — it is resolved back to the real value there, outside your context. Use standard Gmail search syntax for the query (e.g. "from:someone@example.com", "is:unread", "after:2026/01/01").',
   {
     query: z.string().describe('Gmail search query, e.g. "from:bank is:unread"'),
     maxResults: z.number().optional().describe('Max results to return (default 10, max 50)'),
@@ -63,7 +66,7 @@ server.tool(
 
 server.tool(
   'gmail_read_email',
-  'Read one email by id (from gmail_search_emails). Returns the redacted subject and body plus attachment metadata (filename, mime type, size) — attachment CONTENT is never returned. Use gmail_save_attachment_to_drive to move an attachment without opening it.',
+  'Read one email by id (from gmail_search_emails). Returns the anonymized subject and body (PII replaced with numbered tokens like [PHONE_1] — see gmail_search_emails) plus attachment metadata (filename, mime type, size) — attachment CONTENT is never returned. Use gmail_save_attachment_to_drive to move an attachment without opening it.',
   {
     id: z.string().describe('The email id, as returned by gmail_search_emails'),
   },
@@ -210,7 +213,7 @@ server.tool(
 
 server.tool(
   'gmail_create_draft',
-  'Create a Gmail draft — this NEVER sends anything, it only saves to Drafts for the user to review and send themselves. Pass `emailId` (from gmail_search_emails or gmail_read_email) to thread the draft as a reply under that email\'s thread; omit it for a standalone new draft.',
+  'Create a Gmail draft — this NEVER sends anything, it only saves to Drafts for the user to review and send themselves. Pass `emailId` (from gmail_search_emails or gmail_read_email) to thread the draft as a reply under that email\'s thread; omit it for a standalone new draft. `to`, `cc`, `subject`, and `body` may contain anonymization tokens copied from a read email (e.g. [PHONE_1]) — each is resolved back to its real value before the draft is created, so you can relay a value like a phone number without ever seeing it yourself.',
   {
     to: z.string().describe('Recipient address(es), comma-separated for multiple'),
     cc: z.string().optional().describe('Cc address(es), comma-separated'),

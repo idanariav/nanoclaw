@@ -1,6 +1,6 @@
 /**
  * Raw Gmail REST access. Everything here returns UNREDACTED data — callers
- * (server.ts) must run it through redact.ts before it leaves this process.
+ * (server.ts) must run it through anonymize.ts before it leaves this process.
  * Plain REST calls rather than the `googleapis` SDK: two endpoints don't
  * warrant pulling in a client covering every Google API.
  */

@@ -4,16 +4,20 @@
  * NanoClaw host process and of any agent group's container. Binds to
  * localhost only; containers reach it via host.docker.internal.
  *
- * Every response here has already been through redact.ts (email content)
- * or has never carried raw bytes at all (attachment / URL save-to-drive)
- * — that's the boundary this whole service exists to enforce.
+ * Every response here has already been through anonymize.ts (email
+ * content) or has never carried raw bytes at all (attachment / URL
+ * save-to-drive) — that's the boundary this whole service exists to
+ * enforce. Draft creation runs the reverse direction: any anonymization
+ * token in the agent-supplied text (e.g. `[PHONE_1]`) is swapped back to
+ * the real value here, right before it reaches Gmail — the agent's
+ * context never holds the real value, only the token.
  */
 import http from 'http';
 
 import { archiveAndLabel, createDraft, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
 import { applyFilenameOverride, uploadAttachmentToDrive } from './drive-client.js';
 import { fetchUrlToBuffer } from './url-fetch.js';
-import { redactHtml, redactText } from './redact.js';
+import { anonymizeHtml, anonymizeText, deanonymizeText } from './anonymize.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 
@@ -32,9 +36,9 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(data);
 }
 
-function redactedBody(email: Awaited<ReturnType<typeof getEmail>>): string {
-  if (email.bodyText) return redactText(email.bodyText);
-  if (email.bodyHtml) return redactHtml(email.bodyHtml);
+function anonymizedBody(email: Awaited<ReturnType<typeof getEmail>>): string {
+  if (email.bodyText) return anonymizeText(email.bodyText);
+  if (email.bodyHtml) return anonymizeHtml(email.bodyHtml);
   return '';
 }
 
@@ -49,9 +53,9 @@ async function handleListEmails(url: URL, res: http.ServerResponse): Promise<voi
       id: e.id,
       threadId: e.threadId,
       from: e.from,
-      subject: redactText(e.subject),
+      subject: anonymizeText(e.subject),
       date: e.date,
-      snippet: redactText(e.snippet),
+      snippet: anonymizeText(e.snippet),
     })),
   );
 }
@@ -63,9 +67,9 @@ async function handleGetEmail(id: string, res: http.ServerResponse): Promise<voi
     threadId: email.threadId,
     from: email.from,
     to: email.to,
-    subject: redactText(email.subject),
+    subject: anonymizeText(email.subject),
     date: email.date,
-    body: redactedBody(email),
+    body: anonymizedBody(email),
     attachments: email.attachments.map((a) => ({
       attachmentId: a.attachmentId,
       filename: a.filename,
@@ -126,10 +130,10 @@ async function handleCreateDraft(req: http.IncomingMessage, res: http.ServerResp
     return;
   }
   const result = await createDraft({
-    to: body.to,
-    cc: body.cc,
-    subject: body.subject,
-    body: body.body,
+    to: deanonymizeText(body.to),
+    cc: body.cc ? deanonymizeText(body.cc) : undefined,
+    subject: deanonymizeText(body.subject),
+    body: deanonymizeText(body.body),
     emailId: body.emailId,
   });
   sendJson(res, 200, result);
