@@ -49,8 +49,17 @@ describe('anonymizeText', () => {
     expect(anonymizeText('account 12-345-123456', store)).toBe('account [BANK_ACCOUNT_1]');
   });
 
-  it('anonymizes labeled bank/branch/account triples', () => {
-    expect(anonymizeText('Bank: 12 Branch: 345 Account: 1234567', store)).toBe('[BANK_ACCOUNT_1]');
+  it('anonymizes labeled bank/branch/account triples, each as its own token', () => {
+    expect(anonymizeText('Bank: 12 Branch: 345 Account: 1234567', store)).toBe(
+      '[BANK_ACCOUNT_1] [BANK_ACCOUNT_2] [BANK_ACCOUNT_3]',
+    );
+  });
+
+  it('anonymizes a Hebrew bank-details block with one field per line and the bank given by name', () => {
+    const text = 'שם פרטי שם משפחה\nבנק לאומי\nסניף 111\nחשבון 1111111';
+    const result = anonymizeText(text, store);
+    expect(result).toBe('שם פרטי שם משפחה\nבנק לאומי\n[BANK_ACCOUNT_1]\n[BANK_ACCOUNT_2]');
+    expect(result).not.toContain('111');
   });
 
   it('anonymizes Luhn-valid credit-card-shaped numbers', () => {

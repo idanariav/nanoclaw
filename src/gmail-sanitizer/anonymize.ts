@@ -38,9 +38,14 @@ const IL_IBAN_RE = /\bIL\d{2}[\s]?(?:\d{4}[\s]?){4}\d{1,4}\b/gi;
 // Israeli bank-branch-account, dash-separated: bank (1-2) - branch (2-3) - account (6-9)
 const IL_BANK_DASH_RE = /\b\d{1,2}-\d{2,3}-\d{6,9}\b/g;
 
-// Hebrew/English labeled bank/branch/account triples in free text.
-const IL_BANK_LABELED_RE =
-  /(?:bank|בנק)[^\d\n]{0,12}(\d{1,2})[^\d\n]{0,12}(?:branch|סניף)[^\d\n]{0,12}(\d{2,3})[^\d\n]{0,12}(?:account|חשבון)[^\d\n]{0,12}(\d{4,9})/gi;
+// Hebrew/English labeled bank/branch/account fields in free text. Matched
+// independently rather than as one chained "bank...branch...account"
+// pattern — real emails put each field on its own line, and the bank field
+// is often given by name ("בנק לאומי") rather than its numeric code, which
+// would break a chain anchored on that field.
+const IL_BANK_CODE_LABELED_RE = /(?:bank|בנק)[:\-\s]{0,5}(\d{1,2})\b/gi;
+const IL_BANK_BRANCH_LABELED_RE = /(?:branch|סניף)[:\-\s]{0,5}(\d{2,3})\b/gi;
+const IL_BANK_ACCOUNT_LABELED_RE = /(?:account|חשבון)[:\-\s]{0,5}(\d{4,9})\b/gi;
 
 // Credit-card-shaped runs (13-19 digits, optionally grouped), Luhn-validated
 // to cut down false positives on unrelated long numbers.
@@ -200,7 +205,9 @@ function anonymizePhones(text: string, store: AnonymizationStore): string {
 
 function anonymizeBankIdentifiers(text: string, store: AnonymizationStore): string {
   let result = text.replace(IL_IBAN_RE, (m) => store.tokenize('BANK_ACCOUNT', m));
-  result = result.replace(IL_BANK_LABELED_RE, (m) => store.tokenize('BANK_ACCOUNT', m));
+  result = result.replace(IL_BANK_CODE_LABELED_RE, (m) => store.tokenize('BANK_ACCOUNT', m));
+  result = result.replace(IL_BANK_BRANCH_LABELED_RE, (m) => store.tokenize('BANK_ACCOUNT', m));
+  result = result.replace(IL_BANK_ACCOUNT_LABELED_RE, (m) => store.tokenize('BANK_ACCOUNT', m));
   result = result.replace(IL_BANK_DASH_RE, (m) => store.tokenize('BANK_ACCOUNT', m));
   return result;
 }
