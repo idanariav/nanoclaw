@@ -71,6 +71,27 @@ export async function downloadDriveFileBytes(driveFileId: string): Promise<Buffe
   return Buffer.from(await res.arrayBuffer());
 }
 
+export interface DriveUpdateResult {
+  driveFileId: string;
+  webViewLink: string;
+  size: number;
+}
+
+/** Overwrite an existing Drive file's content in place (same file id, same link) — for a canonical working file that gets edited repeatedly, instead of uploadAttachmentToDrive's always-a-new-file behavior. */
+export async function updateDriveFileBytes(
+  driveFileId: string,
+  mimeType: string,
+  bytes: Buffer,
+): Promise<DriveUpdateResult> {
+  const res = await driveFetch(`${DRIVE_UPLOAD_API}/files/${driveFileId}?uploadType=media&fields=id,webViewLink,size`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': mimeType },
+    body: bytes,
+  });
+  const data = (await res.json()) as { id: string; webViewLink: string; size?: string };
+  return { driveFileId: data.id, webViewLink: data.webViewLink, size: data.size ? Number(data.size) : bytes.length };
+}
+
 export async function uploadAttachmentToDrive(
   filename: string,
   mimeType: string,
