@@ -8,24 +8,5 @@
     "name": "@anthropic-ai/claude-code",
     "version": "2.1.257",
     "onlyBuilt": true
-  },
-  {
-    "name": "@idan_ariav/qmd",
-    "version": "2.4.0",
-    "onlyBuiltDeps": ["better-sqlite3"]
-  },
-  {
-    "name": "@idan_ariav/qvoid",
-    "version": "0.4.0"
-  },
-  {
-    "name": "@idan_ariav/qnode",
-    "version": "0.3.0",
-    "onlyBuiltDeps": ["better-sqlite3"]
-  },
-  {
-    "name": "@idan_ariav/qimg",
-    "version": "0.3.1",
-    "onlyBuiltDeps": ["better-sqlite3", "sharp"]
   }
 ]

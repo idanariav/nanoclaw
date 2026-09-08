@@ -1213,12 +1213,23 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     dockerfile += `RUN apt-get update && apt-get install -y ${aptPackages.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
   }
   if (npmPackages.length > 0) {
-    // pnpm skips build scripts unless packages are allowlisted. Append each
-    // to /root/.npmrc (base image sets it up for agent-browser) so packages
-    // with postinstall — e.g. playwright, puppeteer, native addons — don't
-    // install silently broken.
-    const allowlist = npmPackages.map((p) => `echo 'only-built-dependencies[]=${p}' >> /root/.npmrc`).join(' && ');
+    // pnpm skips build scripts unless packages are allowlisted, and matches
+    // by bare package name — a spec's pinned version suffix must be stripped
+    // first, or the entry silently fails to match and the postinstall (e.g. a
+    // native addon's compile/prebuilt-fetch step) never gets approved.
+    const bareName = (spec: string) => {
+      const at = spec.lastIndexOf('@');
+      return at > 0 ? spec.slice(0, at) : spec;
+    };
+    const allowlist = npmPackages
+      .map((p) => `echo 'only-built-dependencies[]=${bareName(p)}' >> /root/.npmrc`)
+      .join(' && ');
     dockerfile += `RUN ${allowlist} && pnpm install -g ${npmPackages.join(' ')}\n`;
+    // Reapply the base image's $PNPM_HOME chmod (see container/Dockerfile):
+    // a package added here that writes a runtime cache inside its own
+    // installed directory needs it too, and files added in this layer don't
+    // inherit the base image's earlier chmod.
+    dockerfile += 'RUN chmod -R 777 "$PNPM_HOME"\n';
   }
   dockerfile += 'USER node\n';
 
