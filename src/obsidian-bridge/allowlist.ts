@@ -6,26 +6,47 @@
  * host mounts). This module is that wall for obsidian-cli: every command not
  * listed here is refused outright (fail-closed), and every command that can
  * target a specific file/folder must do so with an explicit `path=`/`folder=`
- * under one of ALLOWED_ROOTS — `file=<name>` (fuzzy, vault-wide name lookup)
- * is never forwarded, because it could resolve to a same-named note outside
- * the wall. Commands whose output isn't scopable to a path at all (vault-wide
- * listings with no folder filter: `unresolved`, `orphans`, `deadends`,
- * `recents`, `tabs`, `workspace`, `bases`, `tag`, `bookmarks`, `history:list`,
- * `base:views`) are left out rather than risk a filename leak.
+ * under one of the configured allowed roots — `file=<name>` (fuzzy,
+ * vault-wide name lookup) is never forwarded, because it could resolve to a
+ * same-named note outside the wall. Commands whose output isn't scopable to a
+ * path at all (vault-wide listings with no folder filter: `unresolved`,
+ * `orphans`, `deadends`, `recents`, `tabs`, `workspace`, `bases`, `tag`,
+ * `bookmarks`, `history:list`, `base:views`) are left out rather than risk a
+ * filename leak.
  *
  * Also excluded entirely: anything that executes code or controls the app
  * rather than vault content — `eval`, `dev:*`, `devtools`, `command`,
  * `plugin:install`/`uninstall`/`enable`/`disable`/`reload`,
  * `theme:install`/`set`/`uninstall`, `restart`, `sync` (on/off),
  * `plugins:restrict`, `snippet:enable`/`disable`, `reload`.
+ *
+ * Which folders are in bounds is install-specific (every vault names its own
+ * top-level folders), so it is configured at startup via `configureAllowedRoots`
+ * (server.ts reads it from the OBSIDIAN_VAULT_ROOTS env var) rather than
+ * hardcoded here.
  */
 
-export const ALLOWED_ROOTS = ['Scaffolding', 'Sources', 'Content'];
+let allowedRoots: string[] | undefined;
+
+/** Set once at startup. Throws if called with an empty list — an unconfigured allowlist must fail closed, not default-allow everything. */
+export function configureAllowedRoots(roots: string[]): void {
+  if (roots.length === 0) {
+    throw new Error('obsidian-bridge: at least one allowed vault root is required');
+  }
+  allowedRoots = roots;
+}
+
+export function getAllowedRoots(): string[] {
+  if (!allowedRoots) {
+    throw new Error('obsidian-bridge: allowed vault roots not configured — call configureAllowedRoots first');
+  }
+  return allowedRoots;
+}
 
 export function isPathAllowed(raw: string): boolean {
   const p = raw.replace(/^\/+/, '');
   if (p.includes('..')) return false;
-  return ALLOWED_ROOTS.some((root) => p === root || p.startsWith(`${root}/`));
+  return getAllowedRoots().some((root) => p === root || p.startsWith(`${root}/`));
 }
 
 export interface CommandSpec {
@@ -141,7 +162,7 @@ export function buildArgv(command: string, rawArgs: Record<string, unknown>): st
     if (typeof v === 'string' && v !== '' && !isPathAllowed(v)) {
       throw new BridgeRequestError(
         403,
-        `path outside allowed scope: ${field}=${v} (must be under ${ALLOWED_ROOTS.join('/, ')}/)`,
+        `path outside allowed scope: ${field}=${v} (must be under ${getAllowedRoots().join('/, ')}/)`,
       );
     }
   }

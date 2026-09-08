@@ -18,9 +18,9 @@ import http from 'http';
 
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import { BridgeRequestError, buildArgv } from './allowlist.js';
+import { BridgeRequestError, buildArgv, configureAllowedRoots } from './allowlist.js';
 
-const envConfig = readEnvFile(['OBSIDIAN_BRIDGE_PORT', 'OBSIDIAN_BRIDGE_TOKEN']);
+const envConfig = readEnvFile(['OBSIDIAN_BRIDGE_PORT', 'OBSIDIAN_BRIDGE_TOKEN', 'OBSIDIAN_VAULT_ROOTS']);
 const PORT = parseInt(envConfig.OBSIDIAN_BRIDGE_PORT || '8800', 10);
 const TOKEN = envConfig.OBSIDIAN_BRIDGE_TOKEN;
 
@@ -28,6 +28,16 @@ if (!TOKEN) {
   log.fatal('OBSIDIAN_BRIDGE_TOKEN is not set — refusing to start with no shared-secret auth');
   process.exit(1);
 }
+
+const vaultRoots = (envConfig.OBSIDIAN_VAULT_ROOTS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (vaultRoots.length === 0) {
+  log.fatal('OBSIDIAN_VAULT_ROOTS is not set — refusing to start with no vault-path allowlist');
+  process.exit(1);
+}
+configureAllowedRoots(vaultRoots);
 
 const OBSIDIAN_CLI_BIN = '/Applications/Obsidian.app/Contents/MacOS/obsidian-cli';
 const EXEC_TIMEOUT_MS = 30_000;

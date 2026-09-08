@@ -41,6 +41,29 @@ function ensureToken(): void {
   console.log(`  ${token}`);
 }
 
+/**
+ * Which top-level vault folders obsidian-cli requests may target — every
+ * vault names its own, so this has no sane hardcoded default. The bridge
+ * refuses to start without it (see server.ts): an unconfigured allowlist
+ * must fail closed, not silently allow everything.
+ */
+function ensureVaultRoots(): void {
+  const envPath = path.join(projectRoot, '.env');
+  const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
+  if (/^OBSIDIAN_VAULT_ROOTS=/m.test(content)) {
+    console.log('OBSIDIAN_VAULT_ROOTS already set in .env — leaving it as-is.');
+    return;
+  }
+  console.error(
+    'OBSIDIAN_VAULT_ROOTS is not set in .env. Add a comma-separated list of the ' +
+      "vault's top-level folders the bridge may operate on, e.g.:\n\n" +
+      '  OBSIDIAN_VAULT_ROOTS=Scaffolding,Sources,Content\n\n' +
+      'These should match the folders actually mounted into the target agent group\'s ' +
+      'container (see its vault-* mounts). Add the line and re-run this script.',
+  );
+  process.exit(1);
+}
+
 function nodePath(): string {
   return execSync('which node', { encoding: 'utf-8' }).trim();
 }
@@ -108,4 +131,5 @@ if (!fs.existsSync(OBSIDIAN_CLI_BIN)) {
 
 fs.mkdirSync(path.join(projectRoot, 'logs'), { recursive: true });
 ensureToken();
+ensureVaultRoots();
 setupLaunchd();
