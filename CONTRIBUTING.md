@@ -124,7 +124,7 @@ Skills that run inside the agent container, not on the host. These teach the Nan
 - Use `allowed-tools` frontmatter to scope tool permissions
 - Keep them focused — the agent's context window is shared across all container skills
 
-**Install-specific skills:** a skill that's only meaningful for one install (names a personal project, a fixed personal mount path, etc.) rather than being generic/reusable is not trunk-worthy. Name its folder (and `name:` frontmatter) with a `local-` prefix, e.g. `local-updating-website/` — `.gitignore` excludes `container/skills/local-*/` so it stays untracked, the same idea as `CLAUDE.local.md`.
+**Install-specific skills:** a skill that's only meaningful for one install (names a personal project, a fixed personal mount path, bespoke business logic, etc.) rather than being generic/reusable is not trunk-worthy. Name its folder (and `name:` frontmatter) with a `local-` prefix, e.g. `local-updating-website/` — `.gitignore` excludes both `container/skills/local-*/` and `.claude/skills/local-*/` so it stays untracked, the same idea as `CLAUDE.local.md`. This applies whether the install-specific part is a container skill (agent-facing instructions) or an operator/setup skill (e.g. a small extension a generic host-service skill loads via an optional local module — see `add-gmail-sanitizer`'s local-report-extension hook for the pattern).
 
 ### Writing a good skill
 

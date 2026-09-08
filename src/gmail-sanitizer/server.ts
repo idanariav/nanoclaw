@@ -11,16 +11,19 @@
  * token in the agent-supplied text (e.g. `[PHONE_1]`) is swapped back to
  * the real value here, right before it reaches Gmail — the agent's
  * context never holds the real value, only the token.
+ *
+ * Local report extension: everything in this file is generic (any report's
+ * structure goes through excel-reports.ts's config-driven templates). A
+ * bespoke report that needs real code — not just a template entry — can be
+ * wired in without touching this file: drop a module at
+ * ./local-report-extension.ts exporting `routes: LocalRoute[]` (see
+ * report-source.ts), and it's loaded and served automatically. Nothing here
+ * knows or needs to know what such an extension actually does.
  */
 import http from 'http';
 
 import { archiveAndLabel, createDraft, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
-import {
-  applyFilenameOverride,
-  downloadDriveFileBytes,
-  updateDriveFileBytes,
-  uploadAttachmentToDrive,
-} from './drive-client.js';
+import { applyFilenameOverride, uploadAttachmentToDrive } from './drive-client.js';
 import { fetchUrlToBuffer } from './url-fetch.js';
 import { anonymizeHtml, anonymizeText, deanonymizeText } from './anonymize.js';
 import {
@@ -33,12 +36,14 @@ import {
   type CellEdit,
 } from './excel-reports.js';
 import {
-  applyMonthlyReportChangesToBytes,
-  MonthlyReportStructureError,
-  MonthlyReportValidationError,
-  readMonthlyReportFromBytes,
-  type MonthlyReportChanges,
-} from './monthly-report.js';
+  ensureXlsxExtension,
+  readJsonBody,
+  resolveExcelSourceBytes,
+  sendJson,
+  type ExcelSource,
+  type LocalReportExtension,
+  type LocalRoute,
+} from './report-source.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 
@@ -51,12 +56,6 @@ const TOKEN = envConfig.GMAIL_SANITIZER_TOKEN;
 if (!TOKEN) {
   log.fatal('GMAIL_SANITIZER_TOKEN is not set — refusing to start with no shared-secret auth');
   process.exit(1);
-}
-
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
-  const data = JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(data);
 }
 
 function anonymizedBody(email: Awaited<ReturnType<typeof getEmail>>): string {
@@ -121,13 +120,6 @@ async function handleSaveAttachment(
   sendJson(res, 200, result);
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  const raw = Buffer.concat(chunks).toString('utf8');
-  return raw ? JSON.parse(raw) : {};
-}
-
 async function handleSaveUrlToDrive(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = (await readJsonBody(req)) as { url?: string; filename?: string };
   if (!body.url) {
@@ -174,31 +166,6 @@ async function handleArchiveAndLabel(
   }
   await archiveAndLabel(messageId, body.label);
   sendJson(res, 200, { messageId, label: body.label, markedRead: true, archived: true });
-}
-
-interface ExcelSource {
-  emailId?: string;
-  attachmentId?: string;
-  driveFileId?: string;
-}
-
-/** Fetch a source workbook's bytes from either a fresh Gmail attachment or a previously-saved Drive file. */
-async function resolveExcelSourceBytes(source: ExcelSource): Promise<{ bytes: Buffer; originalFilename?: string }> {
-  if (source.emailId && source.attachmentId) {
-    const email = await getEmail(source.emailId);
-    const attachment = email.attachments.find((a) => a.attachmentId === source.attachmentId);
-    if (!attachment) throw new Error(`Attachment ${source.attachmentId} not found on message ${source.emailId}`);
-    const bytes = await getAttachmentBytes(source.emailId, source.attachmentId);
-    return { bytes, originalFilename: attachment.filename };
-  }
-  if (source.driveFileId) {
-    return { bytes: await downloadDriveFileBytes(source.driveFileId) };
-  }
-  throw new Error('Provide either (emailId and attachmentId) or driveFileId');
-}
-
-function ensureXlsxExtension(name: string): string {
-  return name.toLowerCase().endsWith('.xlsx') ? name : `${name}.xlsx`;
 }
 
 /** Maps the excel-reports.ts error types to their HTTP shape. Anything else is rethrown for the top-level catch (502). */
@@ -269,78 +236,23 @@ async function handleExcelEdit(req: http.IncomingMessage, res: http.ServerRespon
   sendJson(res, 200, await uploadAttachmentToDrive(filename, XLSX_MIME_TYPE, newBytes));
 }
 
-/** Maps monthly-report.ts's error types to their HTTP shape. Anything else is rethrown for the top-level catch (502). */
-function sendMonthlyReportError(res: http.ServerResponse, err: unknown): void {
-  if (err instanceof MonthlyReportStructureError) {
-    sendJson(res, 422, { error: err.message });
-    return;
-  }
-  if (err instanceof MonthlyReportValidationError) {
-    sendJson(res, 400, { error: err.message });
-    return;
-  }
-  throw err;
-}
-
-async function handleMonthlyReportRead(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const body = (await readJsonBody(req)) as ExcelSource;
-  let bytes: Buffer;
+/**
+ * Load a local report extension if one is installed. Not found is the
+ * normal, expected case (no local extension) — anything else is a real bug
+ * in the extension and should surface, not be swallowed.
+ */
+async function loadLocalRoutes(): Promise<LocalRoute[]> {
   try {
-    ({ bytes } = await resolveExcelSourceBytes(body));
+    const ext: LocalReportExtension = await import('./local-report-extension.js');
+    log.info('gmail-sanitizer: loaded local report extension', { routes: ext.routes.map((r) => r.pathname) });
+    return ext.routes;
   } catch (err) {
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-    return;
-  }
-  try {
-    sendJson(res, 200, await readMonthlyReportFromBytes(bytes));
-  } catch (err) {
-    sendMonthlyReportError(res, err);
+    if ((err as NodeJS.ErrnoException)?.code === 'ERR_MODULE_NOT_FOUND') return [];
+    throw err;
   }
 }
 
-async function handleMonthlyReportApply(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const body = (await readJsonBody(req)) as ExcelSource & MonthlyReportChanges & { filename?: string };
-  let bytes: Buffer;
-  let originalFilename: string | undefined;
-  try {
-    ({ bytes, originalFilename } = await resolveExcelSourceBytes(body));
-  } catch (err) {
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-    return;
-  }
-
-  let newBytes: Buffer;
-  try {
-    newBytes = await applyMonthlyReportChangesToBytes(bytes, {
-      artists: body.artists,
-      eventRows: body.eventRows,
-      renameSheets: body.renameSheets,
-      reorderSheets: body.reorderSheets,
-      runSync: body.runSync,
-    });
-  } catch (err) {
-    sendMonthlyReportError(res, err);
-    return;
-  }
-
-  // A driveFileId source is the canonical working file — update it in place so repeated
-  // edits across a month don't pile up as new Drive copies. A fresh Gmail attachment has no
-  // existing Drive file yet, so its first save still has to create one.
-  if (body.driveFileId) {
-    sendJson(res, 200, await updateDriveFileBytes(body.driveFileId, XLSX_MIME_TYPE, newBytes));
-    return;
-  }
-  const filename = originalFilename
-    ? ensureXlsxExtension(applyFilenameOverride(originalFilename, body.filename))
-    : body.filename
-      ? ensureXlsxExtension(body.filename)
-      : undefined;
-  if (!filename) {
-    sendJson(res, 400, { error: 'filename is required when saving a fresh attachment for the first time' });
-    return;
-  }
-  sendJson(res, 200, await uploadAttachmentToDrive(filename, XLSX_MIME_TYPE, newBytes));
-}
+const localRoutes = await loadLocalRoutes();
 
 const server = http.createServer(async (req, res) => {
   const auth = req.headers.authorization;
@@ -395,13 +307,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'POST' && url.pathname === '/monthly-report/read') {
-      await handleMonthlyReportRead(req, res);
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/monthly-report/apply') {
-      await handleMonthlyReportApply(req, res);
+    const localRoute = localRoutes.find((r) => r.method === req.method && r.pathname === url.pathname);
+    if (localRoute) {
+      await localRoute.handle(req, res);
       return;
     }
 
