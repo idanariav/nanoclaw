@@ -71,6 +71,17 @@ export async function downloadDriveFileBytes(driveFileId: string): Promise<Buffe
   return Buffer.from(await res.arrayBuffer());
 }
 
+export interface DriveFileMetadata {
+  name: string;
+  mimeType: string;
+}
+
+/** Fetch a Drive file's name and mime type (e.g. to attach it to a draft under its own filename). */
+export async function getDriveFileMetadata(driveFileId: string): Promise<DriveFileMetadata> {
+  const res = await driveFetch(`${DRIVE_API}/files/${driveFileId}?fields=name,mimeType`);
+  return (await res.json()) as DriveFileMetadata;
+}
+
 export interface DriveUpdateResult {
   driveFileId: string;
   webViewLink: string;

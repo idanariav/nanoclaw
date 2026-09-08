@@ -9,6 +9,7 @@ import { AnonymizationStore, deanonymizeText } from './anonymize.js';
 import {
   applyEditsToBytes,
   loadReportTemplates,
+  readRawWorkbook,
   readReportFromBytes,
   ReportTooLargeError,
   RowVerificationError,
@@ -178,6 +179,33 @@ describe('readReportFromBytes', () => {
     }
     const bytes = await buildSingleSheetWorkbook(rows);
     await expect(readReportFromBytes(bytes, store, templatesPath)).rejects.toThrow(ReportTooLargeError);
+  });
+});
+
+describe('readRawWorkbook', () => {
+  it('reads every sheet with no template and no anonymization', async () => {
+    const bytes = await buildMultiSheetWorkbook(); // not registered under any template in this test's empty templatesPath
+
+    const result = await readRawWorkbook(bytes);
+
+    expect(result.anonymized).toBe(false);
+    expect(result.sheets.map((s) => s.sheetName)).toEqual(['Summary', 'Detail']);
+    expect(result.sheets[0].rows[0].values.Total).toBe('2300');
+    expect(result.sheets[1].rows[0].values['Payee Name']).toBe('Alice Cohen'); // raw, not tokenized
+  });
+
+  it('rejects a file larger than the size cap', async () => {
+    const oversized = Buffer.alloc(2 * 1024 * 1024 + 1);
+    await expect(readRawWorkbook(oversized)).rejects.toThrow(ReportTooLargeError);
+  });
+
+  it('rejects a workbook with more than the row-count cap', async () => {
+    const rows: [string, string, string, number, string][] = [];
+    for (let i = 0; i < 5001; i++) {
+      rows.push([`2026-08-${(i % 28) + 1}`, 'Someone', '12-345-123456', i, 'Pending']);
+    }
+    const bytes = await buildSingleSheetWorkbook(rows);
+    await expect(readRawWorkbook(bytes)).rejects.toThrow(ReportTooLargeError);
   });
 });
 

@@ -22,12 +22,26 @@
  */
 import http from 'http';
 
-import { archiveAndLabel, createDraft, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
-import { applyFilenameOverride, uploadAttachmentToDrive } from './drive-client.js';
+import {
+  addLabel,
+  archiveEmail,
+  createDraft,
+  getAttachmentBytes,
+  getEmail,
+  listEmails,
+  resolveAttachmentByPartId,
+} from './gmail-client.js';
+import {
+  applyFilenameOverride,
+  downloadDriveFileBytes,
+  getDriveFileMetadata,
+  uploadAttachmentToDrive,
+} from './drive-client.js';
 import { fetchUrlToBuffer } from './url-fetch.js';
 import { anonymizeHtml, anonymizeText, deanonymizeText } from './anonymize.js';
 import {
   applyEditsToBytes,
+  readRawWorkbook,
   readReportFromBytes,
   ReportTooLargeError,
   RowVerificationError,
@@ -93,7 +107,7 @@ async function handleGetEmail(id: string, res: http.ServerResponse): Promise<voi
     date: email.date,
     body: anonymizedBody(email),
     attachments: email.attachments.map((a) => ({
-      attachmentId: a.attachmentId,
+      partId: a.partId,
       filename: a.filename,
       mimeType: a.mimeType,
       size: a.size,
@@ -103,19 +117,18 @@ async function handleGetEmail(id: string, res: http.ServerResponse): Promise<voi
 
 async function handleSaveAttachment(
   messageId: string,
-  attachmentId: string,
+  partId: string,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
-  const email = await getEmail(messageId);
-  const attachment = email.attachments.find((a) => a.attachmentId === attachmentId);
+  const attachment = await resolveAttachmentByPartId(messageId, partId);
   if (!attachment) {
-    sendJson(res, 404, { error: `Attachment ${attachmentId} not found on message ${messageId}` });
+    sendJson(res, 404, { error: `Attachment part ${partId} not found on message ${messageId}` });
     return;
   }
   const body = (await readJsonBody(req)) as { filename?: string };
   const filename = applyFilenameOverride(attachment.filename, body.filename);
-  const bytes = await getAttachmentBytes(messageId, attachmentId);
+  const bytes = await getAttachmentBytes(messageId, attachment.attachmentId);
   const result = await uploadAttachmentToDrive(filename, attachment.mimeType, bytes);
   sendJson(res, 200, result);
 }
@@ -139,33 +152,47 @@ async function handleCreateDraft(req: http.IncomingMessage, res: http.ServerResp
     subject?: string;
     body?: string;
     emailId?: string;
+    attachments?: string[];
   };
   if (!body.to || !body.subject || !body.body) {
     sendJson(res, 400, { error: 'to, subject, and body are required' });
     return;
   }
+  const attachments = body.attachments?.length
+    ? await Promise.all(
+        body.attachments.map(async (driveFileId) => {
+          const [meta, bytes] = await Promise.all([
+            getDriveFileMetadata(driveFileId),
+            downloadDriveFileBytes(driveFileId),
+          ]);
+          return { filename: meta.name, mimeType: meta.mimeType, bytes };
+        }),
+      )
+    : undefined;
   const result = await createDraft({
     to: deanonymizeText(body.to),
     cc: body.cc ? deanonymizeText(body.cc) : undefined,
     subject: deanonymizeText(body.subject),
     body: deanonymizeText(body.body),
     emailId: body.emailId,
+    attachments,
   });
   sendJson(res, 200, result);
 }
 
-async function handleArchiveAndLabel(
-  messageId: string,
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-): Promise<void> {
+async function handleArchive(messageId: string, res: http.ServerResponse): Promise<void> {
+  await archiveEmail(messageId);
+  sendJson(res, 200, { messageId, markedRead: true, archived: true });
+}
+
+async function handleAddLabel(messageId: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = (await readJsonBody(req)) as { label?: string };
   if (!body.label) {
     sendJson(res, 400, { error: 'label is required' });
     return;
   }
-  await archiveAndLabel(messageId, body.label);
-  sendJson(res, 200, { messageId, label: body.label, markedRead: true, archived: true });
+  await addLabel(messageId, body.label);
+  sendJson(res, 200, { messageId, label: body.label });
 }
 
 /** Maps the excel-reports.ts error types to their HTTP shape. Anything else is rethrown for the top-level catch (502). */
@@ -186,7 +213,7 @@ function sendExcelError(res: http.ServerResponse, err: unknown): void {
 }
 
 async function handleExcelRead(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const body = (await readJsonBody(req)) as ExcelSource;
+  const body = (await readJsonBody(req)) as ExcelSource & { readUnrecognized?: boolean };
   let bytes: Buffer;
   try {
     ({ bytes } = await resolveExcelSourceBytes(body));
@@ -197,6 +224,10 @@ async function handleExcelRead(req: http.IncomingMessage, res: http.ServerRespon
   try {
     sendJson(res, 200, await readReportFromBytes(bytes));
   } catch (err) {
+    if (err instanceof UnrecognizedReportError && body.readUnrecognized) {
+      sendJson(res, 200, await readRawWorkbook(bytes));
+      return;
+    }
     sendExcelError(res, err);
   }
 }
@@ -291,9 +322,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const archiveMatch = url.pathname.match(/^\/emails\/([^/]+)\/archive-and-label$/);
+    const archiveMatch = url.pathname.match(/^\/emails\/([^/]+)\/archive$/);
     if (req.method === 'POST' && archiveMatch) {
-      await handleArchiveAndLabel(decodeURIComponent(archiveMatch[1]), req, res);
+      await handleArchive(decodeURIComponent(archiveMatch[1]), res);
+      return;
+    }
+
+    const labelMatch = url.pathname.match(/^\/emails\/([^/]+)\/label$/);
+    if (req.method === 'POST' && labelMatch) {
+      await handleAddLabel(decodeURIComponent(labelMatch[1]), req, res);
       return;
     }
 

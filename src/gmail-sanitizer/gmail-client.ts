@@ -55,6 +55,9 @@ export interface RawEmailSummary {
 }
 
 export interface RawAttachmentMeta {
+  /** The MIME part id (e.g. "2") — stable across separate messages.get calls, unlike attachmentId below. Use this to re-address the attachment later. */
+  partId: string;
+  /** Gmail mints a new attachmentId on every messages.get call for the same message — only valid for immediate use, never store or compare it across requests. */
   attachmentId: string;
   filename: string;
   mimeType: string;
@@ -86,6 +89,7 @@ function decodeBase64Url(data: string): string {
 function walkParts(part: GmailPart, acc: { text?: string; html?: string; attachments: RawAttachmentMeta[] }): void {
   if (part.filename && part.body?.attachmentId) {
     acc.attachments.push({
+      partId: part.partId ?? '',
       attachmentId: part.body.attachmentId,
       filename: part.filename,
       mimeType: part.mimeType ?? 'application/octet-stream',
@@ -153,6 +157,19 @@ export async function getAttachmentBytes(messageId: string, attachmentId: string
   return Buffer.from(result.data, 'base64url');
 }
 
+/**
+ * Re-fetch the message and find an attachment by its stable partId, returning
+ * its current (freshly-minted, immediately-usable) attachmentId. Callers must
+ * never reuse an attachmentId from an earlier fetch — see RawAttachmentMeta.
+ */
+export async function resolveAttachmentByPartId(
+  messageId: string,
+  partId: string,
+): Promise<RawAttachmentMeta | undefined> {
+  const email = await getEmail(messageId);
+  return email.attachments.find((a) => a.partId === partId);
+}
+
 async function getOrCreateLabelId(name: string): Promise<string> {
   const { labels } = (await gmailFetch('/labels')) as { labels?: { id: string; name: string }[] };
   const existing = labels?.find((l) => l.name.toLowerCase() === name.toLowerCase());
@@ -165,12 +182,20 @@ async function getOrCreateLabelId(name: string): Promise<string> {
   return created.id;
 }
 
-/** Mark read, archive (remove from inbox), and apply a label — one Gmail API call. */
-export async function archiveAndLabel(messageId: string, labelName: string): Promise<void> {
+/** Mark read and archive (remove from inbox). Combine with addLabel below if a label is also wanted. */
+export async function archiveEmail(messageId: string): Promise<void> {
+  await gmailFetch(`/messages/${messageId}/modify`, {
+    method: 'POST',
+    body: { removeLabelIds: ['UNREAD', 'INBOX'] },
+  });
+}
+
+/** Apply a label without archiving or changing read status — for tracking (e.g. "Waiting") rather than processing. */
+export async function addLabel(messageId: string, labelName: string): Promise<void> {
   const labelId = await getOrCreateLabelId(labelName);
   await gmailFetch(`/messages/${messageId}/modify`, {
     method: 'POST',
-    body: { removeLabelIds: ['UNREAD', 'INBOX'], addLabelIds: [labelId] },
+    body: { addLabelIds: [labelId] },
   });
 }
 
@@ -180,22 +205,69 @@ function encodeSubjectHeader(subject: string): string {
   return `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
 }
 
-function buildRawMessage(opts: { to: string; cc?: string; subject: string; body: string; inReplyTo?: string }): string {
+export interface OutgoingAttachment {
+  filename: string;
+  mimeType: string;
+  bytes: Buffer;
+}
+
+function encodeBase64Body(bytes: Buffer): string {
+  return bytes.toString('base64').replace(/(.{76})/g, '$1\r\n');
+}
+
+// Gmail's plain-text renderer picks LTR/RTL per line via its own (imperfect) bidi heuristic, so a
+// Hebrew/Arabic body sent as text/plain can render left-aligned even though every word is RTL.
+// Sending HTML with an explicit `dir` instead makes the direction deterministic. Detected from the
+// body itself (rather than assumed) so this stays correct for any language, not just Hebrew.
+const RTL_CHAR_RE = /[\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function textToHtmlBody(text: string): string {
+  const dir = RTL_CHAR_RE.test(text) ? 'rtl' : 'ltr';
+  const html = escapeHtml(text).replace(/\r\n|\r|\n/g, '<br>\r\n');
+  return `<div dir="${dir}" style="text-align:${dir === 'rtl' ? 'right' : 'left'}">${html}</div>`;
+}
+
+/** Exported for unit testing — pure function, no network I/O. */
+export function buildRawMessage(opts: {
+  to: string;
+  cc?: string;
+  subject: string;
+  body: string;
+  inReplyTo?: string;
+  attachments?: OutgoingAttachment[];
+}): string {
   const headers = [
     `To: ${opts.to}`,
     ...(opts.cc ? [`Cc: ${opts.cc}`] : []),
     `Subject: ${encodeSubjectHeader(opts.subject)}`,
     'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: base64',
   ];
   if (opts.inReplyTo) {
     headers.push(`In-Reply-To: ${opts.inReplyTo}`, `References: ${opts.inReplyTo}`);
   }
-  const encodedBody = Buffer.from(opts.body, 'utf8')
-    .toString('base64')
-    .replace(/(.{76})/g, '$1\r\n');
-  const message = `${headers.join('\r\n')}\r\n\r\n${encodedBody}`;
+
+  if (!opts.attachments || opts.attachments.length === 0) {
+    headers.push('Content-Type: text/html; charset="UTF-8"', 'Content-Transfer-Encoding: base64');
+    const encodedBody = encodeBase64Body(Buffer.from(textToHtmlBody(opts.body), 'utf8'));
+    const message = `${headers.join('\r\n')}\r\n\r\n${encodedBody}`;
+    return Buffer.from(message, 'utf8').toString('base64url');
+  }
+
+  const boundary = `nanoclaw-draft-${Date.now()}`;
+  headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+  const parts = [
+    `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBase64Body(Buffer.from(textToHtmlBody(opts.body), 'utf8'))}`,
+    ...opts.attachments.map(
+      (a) =>
+        `--${boundary}\r\nContent-Type: ${a.mimeType}\r\nContent-Disposition: attachment; filename="${a.filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBase64Body(a.bytes)}`,
+    ),
+    `--${boundary}--`,
+  ];
+  const message = `${headers.join('\r\n')}\r\n\r\n${parts.join('\r\n\r\n')}`;
   return Buffer.from(message, 'utf8').toString('base64url');
 }
 
@@ -216,6 +288,7 @@ export async function createDraft(opts: {
   subject: string;
   body: string;
   emailId?: string;
+  attachments?: OutgoingAttachment[];
 }): Promise<DraftResult> {
   let threadId: string | undefined;
   let inReplyTo: string | undefined;
@@ -224,7 +297,14 @@ export async function createDraft(opts: {
     threadId = original.threadId;
     inReplyTo = original.messageIdHeader || undefined;
   }
-  const raw = buildRawMessage({ to: opts.to, cc: opts.cc, subject: opts.subject, body: opts.body, inReplyTo });
+  const raw = buildRawMessage({
+    to: opts.to,
+    cc: opts.cc,
+    subject: opts.subject,
+    body: opts.body,
+    inReplyTo,
+    attachments: opts.attachments,
+  });
   const created = (await gmailFetch('/drafts', {
     method: 'POST',
     body: { message: { raw, ...(threadId ? { threadId } : {}) } },

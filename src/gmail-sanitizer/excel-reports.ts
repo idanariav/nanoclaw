@@ -130,6 +130,7 @@ function getSheetOrThrow(wb: ExcelJS.Workbook, sheetName: string): Worksheet {
 
 export interface ReadResult {
   reportId: string;
+  anonymized: true;
   sheets: {
     sheetName: string;
     headers: string[];
@@ -180,7 +181,52 @@ export async function readReportFromBytes(
       rows,
     });
   }
-  return { reportId: outcome.template.id, sheets };
+  return { reportId: outcome.template.id, anonymized: true, sheets };
+}
+
+export interface RawReadResult {
+  anonymized: false;
+  sheets: {
+    sheetName: string;
+    headers: string[];
+    rows: { row: number; values: Record<string, string> }[];
+  }[];
+}
+
+/**
+ * Read every sheet's rows as raw, non-anonymized values (header row assumed
+ * to be row 1) — for a one-off read of a file that doesn't match any
+ * registered template. Sensitive columns can't be detected without a
+ * template, so callers must only use this after explicit user approval for
+ * that specific file — see gmail_read_excel_attachment's `readUnrecognized`.
+ */
+export async function readRawWorkbook(bytes: Buffer): Promise<RawReadResult> {
+  assertWithinSizeCap(bytes);
+  const wb = await loadWorkbook(bytes);
+
+  let totalRows = 0;
+  const sheets: RawReadResult['sheets'] = [];
+  for (const sheet of wb.worksheets) {
+    const headers = readHeaderRow(sheet, 1);
+    const rows: { row: number; values: Record<string, string> }[] = [];
+    for (let r = 2; r <= sheet.rowCount; r++) {
+      const rowObj = sheet.getRow(r);
+      if (!rowObj.hasValues) continue;
+
+      totalRows += 1;
+      if (totalRows > MAX_TOTAL_ROWS) {
+        throw new ReportTooLargeError(`Workbook has more than ${MAX_TOTAL_ROWS} data rows.`);
+      }
+
+      const values: Record<string, string> = {};
+      headers.forEach((header, idx) => {
+        values[header || `col_${idx + 1}`] = rowObj.getCell(idx + 1).text;
+      });
+      rows.push({ row: r, values });
+    }
+    sheets.push({ sheetName: sheet.name, headers, rows });
+  }
+  return { anonymized: false, sheets };
 }
 
 export interface CellEdit {

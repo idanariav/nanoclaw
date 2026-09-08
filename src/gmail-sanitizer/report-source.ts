@@ -9,7 +9,7 @@
  */
 import http from 'http';
 
-import { getAttachmentBytes, getEmail } from './gmail-client.js';
+import { getAttachmentBytes, resolveAttachmentByPartId } from './gmail-client.js';
 import { downloadDriveFileBytes } from './drive-client.js';
 
 export function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
@@ -27,7 +27,7 @@ export async function readJsonBody(req: http.IncomingMessage): Promise<unknown> 
 
 export interface ExcelSource {
   emailId?: string;
-  attachmentId?: string;
+  partId?: string;
   driveFileId?: string;
 }
 
@@ -35,17 +35,16 @@ export interface ExcelSource {
 export async function resolveExcelSourceBytes(
   source: ExcelSource,
 ): Promise<{ bytes: Buffer; originalFilename?: string }> {
-  if (source.emailId && source.attachmentId) {
-    const email = await getEmail(source.emailId);
-    const attachment = email.attachments.find((a) => a.attachmentId === source.attachmentId);
-    if (!attachment) throw new Error(`Attachment ${source.attachmentId} not found on message ${source.emailId}`);
-    const bytes = await getAttachmentBytes(source.emailId, source.attachmentId);
+  if (source.emailId && source.partId) {
+    const attachment = await resolveAttachmentByPartId(source.emailId, source.partId);
+    if (!attachment) throw new Error(`Attachment part ${source.partId} not found on message ${source.emailId}`);
+    const bytes = await getAttachmentBytes(source.emailId, attachment.attachmentId);
     return { bytes, originalFilename: attachment.filename };
   }
   if (source.driveFileId) {
     return { bytes: await downloadDriveFileBytes(source.driveFileId) };
   }
-  throw new Error('Provide either (emailId and attachmentId) or driveFileId');
+  throw new Error('Provide either (emailId and partId) or driveFileId');
 }
 
 export function ensureXlsxExtension(name: string): string {

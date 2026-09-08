@@ -95,14 +95,14 @@ server.tool(
   'Save an email attachment directly to Drive without ever opening/reading its content. The attachment bytes never pass through you — this downloads and re-uploads server-side and returns only the resulting Drive file id/link. Pass `filename` to rename the file on save (e.g. per a naming convention) — give it without an extension; the original file extension is kept automatically.',
   {
     emailId: z.string().describe('The email id (from gmail_search_emails or gmail_read_email)'),
-    attachmentId: z.string().describe('The attachment id (from gmail_read_email\'s attachments list)'),
+    partId: z.string().describe('The attachment\'s part id (from gmail_read_email\'s attachments list)'),
     filename: z.string().optional().describe('Optional new filename (without extension) to save the file as, instead of its original name'),
   },
   async (args) => {
-    log(`Saving attachment ${args.attachmentId} from email ${args.emailId} to Drive`);
+    log(`Saving attachment ${args.partId} from email ${args.emailId} to Drive`);
     try {
       const res = await sanitizerFetch(
-        `/emails/${encodeURIComponent(args.emailId)}/attachments/${encodeURIComponent(args.attachmentId)}/save-to-drive`,
+        `/emails/${encodeURIComponent(args.emailId)}/attachments/${encodeURIComponent(args.partId)}/save-to-drive`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -169,16 +169,51 @@ server.tool(
 );
 
 server.tool(
-  'gmail_archive_and_label',
-  'Mark an email as read, archive it (remove from inbox), and apply a label — one action, for cleaning up an email after you\'ve saved what you needed from it. The label is created if it doesn\'t already exist.',
+  'gmail_archive',
+  'Mark an email as read and archive it (remove from inbox) — for cleaning up an email after you\'ve saved what you needed from it. Combine with gmail_add_label if you also want to tag it (e.g. label "Artists" for a processed invoice).',
   {
     id: z.string().describe('The email id (from gmail_search_emails or gmail_read_email)'),
-    label: z.string().describe('The Gmail label to apply, e.g. "Artists"'),
   },
   async (args) => {
-    log(`Archiving and labeling email ${args.id} as "${args.label}"`);
+    log(`Archiving email ${args.id}`);
     try {
-      const res = await sanitizerFetch(`/emails/${encodeURIComponent(args.id)}/archive-and-label`, {
+      const res = await sanitizerFetch(`/emails/${encodeURIComponent(args.id)}/archive`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gmail_add_label',
+  'Apply a Gmail label to an email without archiving it or changing its read status — the label is created if it doesn\'t already exist. Use this (not gmail_archive) when the email should stay visible in the inbox, e.g. labeling "Waiting" after a draft reply asks a question that\'s awaiting the recipient\'s answer. Combine with gmail_archive if you want both (e.g. label "Artists" and archive a processed invoice).',
+  {
+    id: z.string().describe('The email id (from gmail_search_emails or gmail_read_email)'),
+    label: z.string().describe('The Gmail label to apply, e.g. "Waiting"'),
+  },
+  async (args) => {
+    log(`Labeling email ${args.id} as "${args.label}"`);
+    try {
+      const res = await sanitizerFetch(`/emails/${encodeURIComponent(args.id)}/label`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ label: args.label }),
@@ -207,19 +242,23 @@ server.tool(
 
 server.tool(
   'gmail_create_draft',
-  'Create a Gmail draft — this NEVER sends anything, it only saves to Drafts for the user to review and send themselves. Pass `emailId` (from gmail_search_emails or gmail_read_email) to thread the draft as a reply under that email\'s thread; omit it for a standalone new draft. `to`, `cc`, `subject`, and `body` may contain anonymization tokens copied from a read email (e.g. [PHONE_1]) — each is resolved back to its real value before the draft is created, so you can relay a value like a phone number without ever seeing it yourself.',
+  'Create a Gmail draft — this NEVER sends anything, it only saves to Drafts for the user to review and send themselves. Pass `emailId` (from gmail_search_emails or gmail_read_email) to thread the draft as a reply under that email\'s thread; omit it for a standalone new draft. `to`, `cc`, `subject`, and `body` may contain anonymization tokens copied from a read email (e.g. [PHONE_1]) — each is resolved back to its real value before the draft is created, so you can relay a value like a phone number without ever seeing it yourself. Pass `attachments` to attach one or more files already saved to Drive (e.g. via gmail_save_attachment_to_drive, gmail_save_url_to_drive, or gmail_edit_excel_attachment) — each is fetched from Drive and attached to the draft under its own filename; the bytes never pass through you.',
   {
     to: z.string().describe('Recipient address(es), comma-separated for multiple'),
     cc: z.string().optional().describe('Cc address(es), comma-separated'),
     subject: z.string().describe('Subject line (Hebrew supported)'),
-    body: z.string().describe('Plain-text body (Hebrew supported)'),
+    body: z.string().describe('Plain-text body (Hebrew supported — rendered right-to-left automatically when the body contains Hebrew/Arabic text)'),
     emailId: z
       .string()
       .optional()
       .describe('The email id to thread this draft as a reply under (from gmail_search_emails or gmail_read_email)'),
+    attachments: z
+      .array(z.string())
+      .optional()
+      .describe('Drive file ids to attach (from gmail_save_attachment_to_drive, gmail_save_url_to_drive, or gmail_edit_excel_attachment)'),
   },
   async (args) => {
-    log(`Creating draft to ${args.to}${args.emailId ? ` (reply to ${args.emailId})` : ''}`);
+    log(`Creating draft to ${args.to}${args.emailId ? ` (reply to ${args.emailId})` : ''}${args.attachments?.length ? ` with ${args.attachments.length} attachment(s)` : ''}`);
     try {
       const res = await sanitizerFetch('/drafts', {
         method: 'POST',
@@ -230,6 +269,7 @@ server.tool(
           subject: args.subject,
           body: args.body,
           emailId: args.emailId,
+          attachments: args.attachments,
         }),
       });
       if (!res.ok) {
@@ -256,19 +296,28 @@ server.tool(
 
 server.tool(
   'gmail_read_excel_attachment',
-  'Read an Excel (.xlsx) attachment from an email, or a file already saved to Drive, as structured row/column data. Provide either (emailId + attachmentId) for a fresh attachment, or driveFileId for a previously-saved one. Columns the report\'s owner has marked sensitive (e.g. account numbers, names) come back as numbered tokens like [CELL_1] — same rule as other PII tokens: the same real value always gets the same token, and you can paste a token into gmail_edit_excel_attachment to write that sensitive value back unchanged without ever seeing it. Only files matching a known, pre-configured report template (an exact sheet name + header row match) can be read — an unrecognized file returns an error naming the sheets/headers it found, rather than exposing unreviewed data; ask the user to add a template for it if that happens. Row numbers in the result are how you address rows in an edit.',
+  'Read an Excel (.xlsx) attachment from an email, or a file already saved to Drive, as structured row/column data. Provide either (emailId + partId) for a fresh attachment, or driveFileId for a previously-saved one. Columns the report\'s owner has marked sensitive (e.g. account numbers, names) come back as numbered tokens like [CELL_1] — same rule as other PII tokens: the same real value always gets the same token, and you can paste a token into gmail_edit_excel_attachment to write that sensitive value back unchanged without ever seeing it. Only files matching a known, pre-configured report template (an exact sheet name + header row match) get this anonymized treatment — an unrecognized file returns an error naming the sheets/headers it found, rather than exposing unreviewed data. From there you have two options: ask the user to add a template for it (durable, keeps future reads anonymized), or — for a genuine one-off file you don\'t expect to see again — ask the user directly (e.g. via ask_user_question) whether you may read it anyway UNREDACTED, and if they say yes, retry the same call with `readUnrecognized: true`. Never set that flag without asking first; the result it returns has `anonymized: false` and no sensitive-column protection at all, so treat any PII in it with care. Row numbers in the result are how you address rows in an edit (edits still require a registered template — reading unrecognized is read-only).',
   {
     emailId: z.string().optional().describe('The email id (from gmail_search_emails or gmail_read_email)'),
-    attachmentId: z.string().optional().describe('The attachment id (from gmail_read_email\'s attachments list)'),
+    partId: z.string().optional().describe('The attachment\'s part id (from gmail_read_email\'s attachments list)'),
     driveFileId: z.string().optional().describe('A Drive file id, for a file already saved to Drive instead of a fresh Gmail attachment'),
+    readUnrecognized: z
+      .boolean()
+      .optional()
+      .describe('Only after the user has explicitly approved reading this specific file unredacted — read it even though it matches no registered template. Never set true without asking the user first.'),
   },
   async (args) => {
-    log(`Reading Excel attachment${args.attachmentId ? ` ${args.attachmentId}` : ''}${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}`);
+    log(`Reading Excel attachment${args.partId ? ` ${args.partId}` : ''}${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}${args.readUnrecognized ? ' [unredacted, user-approved]' : ''}`);
     try {
       const res = await sanitizerFetch('/excel/read', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ emailId: args.emailId, attachmentId: args.attachmentId, driveFileId: args.driveFileId }),
+        body: JSON.stringify({
+          emailId: args.emailId,
+          partId: args.partId,
+          driveFileId: args.driveFileId,
+          readUnrecognized: args.readUnrecognized,
+        }),
       });
       if (!res.ok) {
         return {
@@ -296,8 +345,8 @@ server.tool(
   'gmail_edit_excel_attachment',
   'Apply targeted cell edits and/or append rows to an Excel report previously read with gmail_read_excel_attachment, saving the result as a NEW file in Drive — this never modifies the original attachment and never creates a Gmail draft. Only cell-value changes and row appends are supported: no new columns, no formula or formatting changes, no row/column deletion. Address edits by the row number and column (header name) returned from gmail_read_excel_attachment. If a sheet has a key column, pass `keyColumnValue` with the value you read in that row\'s key column — the edit is verified against the live file and rejected (with nothing written) if the row no longer matches, which catches the file having changed since you read it. If a value you\'re writing is a token like [CELL_1] copied from a read, it resolves to the real value here, server-side — you never need to see or type the real value. Returns the new file\'s Drive id/link; mention it in your reply, it is not attached to anything automatically.',
   {
-    emailId: z.string().optional().describe('The email id, if editing a fresh Gmail attachment (with attachmentId)'),
-    attachmentId: z.string().optional().describe('The attachment id, if editing a fresh Gmail attachment (with emailId)'),
+    emailId: z.string().optional().describe('The email id, if editing a fresh Gmail attachment (with partId)'),
+    partId: z.string().optional().describe('The attachment\'s part id, if editing a fresh Gmail attachment (with emailId)'),
     driveFileId: z.string().optional().describe('A Drive file id, if editing a file already saved to Drive'),
     cellEdits: z
       .array(
@@ -329,14 +378,14 @@ server.tool(
       .describe('Filename for the saved file (with or without .xlsx). Defaults to the original attachment\'s filename; required when editing a driveFileId with no known original name.'),
   },
   async (args) => {
-    log(`Editing Excel attachment${args.attachmentId ? ` ${args.attachmentId}` : ''}${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}`);
+    log(`Editing Excel attachment${args.partId ? ` ${args.partId}` : ''}${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}`);
     try {
       const res = await sanitizerFetch('/excel/edit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           emailId: args.emailId,
-          attachmentId: args.attachmentId,
+          partId: args.partId,
           driveFileId: args.driveFileId,
           cellEdits: args.cellEdits,
           appendRows: args.appendRows,
