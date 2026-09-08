@@ -23,8 +23,29 @@
  * through plain exceljs (same as excel-reports.ts), which silently drops
  * `vbaProject.bin` on write. That's intentional, not a bug: the file is
  * expected to live on as a working .xlsx, not stay a macro-enabled .xlsm.
+ *
+ * exceljs's own load→write round trip is NOT safe to trust wholesale on this workbook — confirmed
+ * against a real finalized report, a bare round trip with ZERO edits already:
+ *  - truncates Excel Tables' `tableColumns` (8→3, 17→7 on this file) while leaving their `ref`
+ *    range unchanged, an internally-inconsistent table Excel can't open without "repairing" by
+ *    deleting the Table/AutoFilter outright (root cause: its table-column parser chokes on
+ *    structured-reference `calculatedColumnFormula` entries);
+ *  - silently drops cfRule children from `conditionalFormatting` blocks, and drops `hyperlinks`
+ *    blocks almost entirely, on most sheets;
+ *  - freely reorders/rebuilds `xl/sharedStrings.xml` and `xl/styles.xml` on every write, so a
+ *    cell's `t="s"`/`s=` index only means the same thing within the SAME write's tables — reusing
+ *    an index across two different writes silently points at the wrong string/style.
+ * `reconcileWorkbookOutput` (below `applyMonthlyReportChangesToBytes`) is the fix: it makes the
+ * pre-edit bytes the source of truth everywhere this module didn't itself change something —
+ * restoring `xl/tables/*.xml` and `xl/styles.xml` verbatim (never touched by this module's
+ * writes, except runSync's Byname step — a known, narrower residual risk not yet covered here),
+ * restoring any untouched worksheet verbatim (sidestepping the conditionalFormatting/hyperlinks
+ * bugs on it for free), and remapping touched worksheets' shared-string cell references back onto
+ * the original `sharedStrings.xml` table (extended with anything genuinely new) so that table,
+ * too, can stay the original rather than exceljs's rebuilt one.
  */
 import ExcelJS, { type Workbook, type Worksheet } from 'exceljs';
+import JSZip from 'jszip';
 
 import { AnonymizationStore, anonymizeCellValue, deanonymizeText } from './anonymize.js';
 
@@ -65,6 +86,411 @@ async function loadWorkbook(bytes: Buffer): Promise<Workbook> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(bytes as any); // eslint-disable-line @typescript-eslint/no-explicit-any
   return wb;
+}
+
+function parseXmlAttrs(tag: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  for (const m of tag.matchAll(/([\w:]+)="([^"]*)"/g)) attrs[m[1]] = m[2];
+  return attrs;
+}
+
+/** Maps each worksheet's stable `sheetId` (survives rename/reorder — unlike its file name or tab position) to its `xl/worksheets/sheetN.xml` path within one zip. */
+async function sheetIdToWorksheetPath(zip: JSZip): Promise<Map<number, string>> {
+  const workbookXml = await zip.file('xl/workbook.xml')!.async('string');
+  const relsXml = (await zip.file('xl/_rels/workbook.xml.rels')?.async('string')) ?? '';
+  const relIdToTarget = new Map<string, string>();
+  for (const m of relsXml.matchAll(/<Relationship\s+([^>]*)\/>/g)) {
+    const attrs = parseXmlAttrs(m[1]);
+    if (attrs.Id && attrs.Target) relIdToTarget.set(attrs.Id, attrs.Target);
+  }
+  const result = new Map<number, string>();
+  for (const m of workbookXml.matchAll(/<sheet\s+([^>]*)\/>/g)) {
+    const attrs = parseXmlAttrs(m[1]);
+    const sheetId = attrs.sheetId ? Number(attrs.sheetId) : undefined;
+    const target = attrs['r:id'] ? relIdToTarget.get(attrs['r:id']) : undefined;
+    if (sheetId !== undefined && target) result.set(sheetId, `xl/${target}`);
+  }
+  return result;
+}
+
+/** Each `<si>`'s raw inner XML, in table order — used as an exact-match key (identical inner XML, plain or rich text, means the same string). */
+function parseSharedStrings(xml: string | undefined): string[] {
+  if (!xml) return [];
+  return [...xml.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/g)].map((m) => m[1]);
+}
+
+/** Generic append-only "intern by exact content" table — same technique used for shared strings, fonts, fills, borders, and (via `remapXf`) cellXfs below: two entries with identical raw XML are the same resource, existing entries/indices never move, a genuinely new one is appended. */
+interface ContentTable {
+  entries: string[];
+  indexByContent: Map<string, number>;
+}
+
+function buildContentTable(entries: string[]): ContentTable {
+  const indexByContent = new Map<string, number>();
+  entries.forEach((entry, i) => {
+    if (!indexByContent.has(entry)) indexByContent.set(entry, i);
+  });
+  return { entries: [...entries], indexByContent };
+}
+
+function internContent(table: ContentTable, content: string): number {
+  const existing = table.indexByContent.get(content);
+  if (existing !== undefined) return existing;
+  const index = table.entries.length;
+  table.entries.push(content);
+  table.indexByContent.set(content, index);
+  return index;
+}
+
+// Matches a shared-string cell (`t="s"`) up through its `<v>` index, non-greedy so an optional
+// `<f>...</f>` (a formula cell whose cached result is a shared string) in between is left alone —
+// only the `<v>` index itself gets rewritten.
+const SHARED_STRING_CELL_RE = /(<c\b[^>]*\bt="s"[^>]*>(?:(?!<\/c>)[\s\S])*?<v>)(\d+)(<\/v>)/g;
+
+/** Rewrites a worksheet's shared-string cell references from `sourceEntries`' index space into `targetTable`'s, interning any string `targetTable` doesn't already have (appended, never reordering existing entries). */
+function remapSharedStringCells(sheetXml: string, sourceEntries: string[], targetTable: ContentTable): string {
+  return sheetXml.replace(SHARED_STRING_CELL_RE, (_match, prefix, indexStr, suffix) => {
+    const newIndex = internContent(targetTable, sourceEntries[Number(indexStr)] ?? '');
+    return `${prefix}${newIndex}${suffix}`;
+  });
+}
+
+function countSharedStringRefs(sheetXml: string): number {
+  return [...sheetXml.matchAll(SHARED_STRING_CELL_RE)].length;
+}
+
+function serializeSharedStrings(table: ContentTable, totalCount: number): string {
+  const body = table.entries.map((entry) => `<si>${entry}</si>`).join('');
+  return (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' +
+    `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${totalCount}" uniqueCount="${table.entries.length}">${body}</sst>`
+  );
+}
+
+/** Every `<entryTag>` inside a styles.xml `<sectionTag>...</sectionTag>` block, as raw XML (self-closing or with children — e.g. `<xf ...><alignment .../></xf>`). Empty/absent section → []. */
+function parseStyleSection(styleSheetXml: string, sectionTag: string, entryTag: string): string[] {
+  const section = new RegExp(`<${sectionTag}\\b[^>]*>([\\s\\S]*?)</${sectionTag}>`).exec(styleSheetXml)?.[1];
+  if (!section) return [];
+  const entryRe = new RegExp(`<${entryTag}\\b[^>]*?(?:/>|>[\\s\\S]*?</${entryTag}>)`, 'g');
+  return section.match(entryRe) ?? [];
+}
+
+/** `numFmtId -> formatCode` for every CUSTOM number format declared in this styles.xml (built-ins, id 0-163, are never declared and need no remapping — they mean the same thing everywhere). */
+function parseCustomNumFmts(styleSheetXml: string): Map<number, string> {
+  const result = new Map<number, string>();
+  for (const raw of parseStyleSection(styleSheetXml, 'numFmts', 'numFmt')) {
+    const attrs = parseXmlAttrs(raw);
+    if (attrs.numFmtId) result.set(Number(attrs.numFmtId), attrs.formatCode ?? '');
+  }
+  return result;
+}
+
+/** Interns a formatCode into the canonical custom-numFmts table, assigning a fresh id (164+, past both tables' existing ids) the first time a given formatCode is seen. */
+function internNumFmt(canonical: Map<string, number>, nextId: { value: number }, formatCode: string): number {
+  const existing = canonical.get(formatCode);
+  if (existing !== undefined) return existing;
+  const id = nextId.value++;
+  canonical.set(formatCode, id);
+  return id;
+}
+
+/**
+ * Rewrites one written cellXfs `<xf>` entry's numFmtId/fontId/fillId/borderId from the written
+ * styles.xml's index spaces into the canonical (original-based) ones, then interns the
+ * fully-remapped entry into `canonicalXfs` — the same append-only pattern as everything else
+ * here, just applied to a structured entry instead of an opaque string.
+ */
+function remapXf(
+  rawXf: string,
+  writtenCustomNumFmts: Map<number, string>,
+  canonicalNumFmtIdByFormatCode: Map<string, number>,
+  nextCustomNumFmtId: { value: number },
+  writtenFonts: string[],
+  canonicalFonts: ContentTable,
+  writtenFills: string[],
+  canonicalFills: ContentTable,
+  writtenBorders: string[],
+  canonicalBorders: ContentTable,
+): string {
+  const openTag = /^<xf\b([^>]*?)(\/)?>/.exec(rawXf)!;
+  const attrs = parseXmlAttrs(openTag[1]);
+  const rest = openTag[2] ? '' : rawXf.slice(openTag[0].length, -'</xf>'.length);
+
+  if (attrs.numFmtId !== undefined) {
+    const formatCode = writtenCustomNumFmts.get(Number(attrs.numFmtId));
+    if (formatCode !== undefined) {
+      attrs.numFmtId = String(internNumFmt(canonicalNumFmtIdByFormatCode, nextCustomNumFmtId, formatCode));
+    }
+  }
+  if (attrs.fontId !== undefined) {
+    attrs.fontId = String(internContent(canonicalFonts, writtenFonts[Number(attrs.fontId)] ?? ''));
+  }
+  if (attrs.fillId !== undefined) {
+    attrs.fillId = String(internContent(canonicalFills, writtenFills[Number(attrs.fillId)] ?? ''));
+  }
+  if (attrs.borderId !== undefined) {
+    attrs.borderId = String(internContent(canonicalBorders, writtenBorders[Number(attrs.borderId)] ?? ''));
+  }
+
+  const attrStr = Object.entries(attrs)
+    .map(([k, v]) => `${k}="${v}"`)
+    .join(' ');
+  return rest ? `<xf ${attrStr}>${rest}</xf>` : `<xf ${attrStr}/>`;
+}
+
+// Matches any cell's `s="N"` style index (order-agnostic w.r.t. the cell's other attributes).
+const CELL_STYLE_RE = /(<c\b[^>]*\bs=")(\d+)("[^>]*>)/g;
+
+/**
+ * Remaps a touched worksheet's cell style (`s=`) indices the same way `remapSharedStringCells`
+ * remaps `t="s"` value indices — from the written styles.xml's cellXfs index space into the
+ * canonical (original-based) one, extended with anything genuinely new. See this file's header
+ * comment: this is what makes it safe to restore `xl/styles.xml` to the original wholesale even
+ * though a touched sheet can legitimately need a style the original never had (e.g. a date-typed
+ * cell that was previously blank).
+ */
+function remapCellStyles(
+  sheetXml: string,
+  writtenXfs: string[],
+  canonicalXfs: ContentTable,
+  writtenCustomNumFmts: Map<number, string>,
+  canonicalNumFmtIdByFormatCode: Map<string, number>,
+  nextCustomNumFmtId: { value: number },
+  writtenFonts: string[],
+  canonicalFonts: ContentTable,
+  writtenFills: string[],
+  canonicalFills: ContentTable,
+  writtenBorders: string[],
+  canonicalBorders: ContentTable,
+): string {
+  return sheetXml.replace(CELL_STYLE_RE, (_match, prefix, indexStr, suffix) => {
+    const rawXf = writtenXfs[Number(indexStr)];
+    if (rawXf === undefined) return `${prefix}${indexStr}${suffix}`;
+    const remapped = remapXf(
+      rawXf,
+      writtenCustomNumFmts,
+      canonicalNumFmtIdByFormatCode,
+      nextCustomNumFmtId,
+      writtenFonts,
+      canonicalFonts,
+      writtenFills,
+      canonicalFills,
+      writtenBorders,
+      canonicalBorders,
+    );
+    return `${prefix}${internContent(canonicalXfs, remapped)}${suffix}`;
+  });
+}
+
+function serializeStyleSheet(
+  originalStyleSheetXml: string,
+  canonicalNumFmtIdByFormatCode: Map<string, number>,
+  canonicalFonts: ContentTable,
+  canonicalFills: ContentTable,
+  canonicalBorders: ContentTable,
+  canonicalXfs: ContentTable,
+): string {
+  const numFmtsXml =
+    canonicalNumFmtIdByFormatCode.size === 0
+      ? ''
+      : `<numFmts count="${canonicalNumFmtIdByFormatCode.size}">${[...canonicalNumFmtIdByFormatCode]
+          .map(([formatCode, id]) => `<numFmt numFmtId="${id}" formatCode="${formatCode}"/>`)
+          .join('')}</numFmts>`;
+  // Fonts/fills/borders entries are captured (and stored) as their own full <font>/<fill>/<border>
+  // tag — see parseStyleSection — so they're joined directly, not re-wrapped.
+  const fontsXml = `<fonts count="${canonicalFonts.entries.length}">${canonicalFonts.entries.join('')}</fonts>`;
+  const fillsXml = `<fills count="${canonicalFills.entries.length}">${canonicalFills.entries.join('')}</fills>`;
+  const bordersXml = `<borders count="${canonicalBorders.entries.length}">${canonicalBorders.entries.join('')}</borders>`;
+  const cellXfsXml = `<cellXfs count="${canonicalXfs.entries.length}">${canonicalXfs.entries.join('')}</cellXfs>`;
+
+  let result = originalStyleSheetXml;
+  result = /<numFmts\b[^>]*>[\s\S]*?<\/numFmts>/.test(result)
+    ? result.replace(/<numFmts\b[^>]*>[\s\S]*?<\/numFmts>/, numFmtsXml)
+    : numFmtsXml
+      ? result.replace(/(<styleSheet\b[^>]*>)/, `$1${numFmtsXml}`)
+      : result;
+  result = result.replace(/<fonts\b[^>]*>[\s\S]*?<\/fonts>/, fontsXml);
+  result = result.replace(/<fills\b[^>]*>[\s\S]*?<\/fills>/, fillsXml);
+  result = result.replace(/<borders\b[^>]*>[\s\S]*?<\/borders>/, bordersXml);
+  result = result.replace(/<cellXfs\b[^>]*>[\s\S]*?<\/cellXfs>/, cellXfsXml);
+  return result;
+}
+
+function nextAvailableRelId(relsXml: string): string {
+  const used = new Set([...relsXml.matchAll(/\bId="rId(\d+)"/g)].map((m) => Number(m[1])));
+  let n = 1;
+  while (used.has(n)) n++;
+  return `rId${n}`;
+}
+
+/**
+ * exceljs's writer drops `xl/metadata.xml` (and its `[Content_Types].xml`/`workbook.xml.rels`
+ * registrations) entirely on write — but leaves the `cm="N"` cell-metadata attribute in place on
+ * every array-formula cell that referenced it. Confirmed against a real report: הכנסות/הוצאות's
+ * structured-Table calculated columns carry `cm="1"` on ~940 cells between them; with the part
+ * gone, Excel treats every one of those as a dangling reference and repairs ("Cell information")
+ * both sheets. This module never touches cell metadata, so restore the part verbatim and re-wire
+ * it in — same technique as the table/worksheet restores above, just for a workbook-level part
+ * instead of a per-sheet one.
+ */
+async function restoreDroppedMetadataPart(originalZip: JSZip, writtenZip: JSZip): Promise<void> {
+  const partPath = 'xl/metadata.xml';
+  const originalFile = originalZip.file(partPath);
+  if (!originalFile || writtenZip.file(partPath)) return; // nothing to restore, or already present
+
+  writtenZip.file(partPath, await originalFile.async('nodebuffer'));
+
+  const contentTypesPath = '[Content_Types].xml';
+  const originalContentTypes = await originalZip.file(contentTypesPath)?.async('string');
+  const overrideMatch =
+    originalContentTypes && /<Override PartName="\/xl\/metadata\.xml"[^>]*?\/>/.exec(originalContentTypes);
+  const writtenContentTypes = await writtenZip.file(contentTypesPath)?.async('string');
+  if (overrideMatch && writtenContentTypes && !writtenContentTypes.includes(overrideMatch[0])) {
+    writtenZip.file(contentTypesPath, writtenContentTypes.replace('</Types>', `${overrideMatch[0]}</Types>`));
+  }
+
+  const workbookRelsPath = 'xl/_rels/workbook.xml.rels';
+  const originalRels = await originalZip.file(workbookRelsPath)?.async('string');
+  const relMatch = originalRels && /<Relationship\b[^>]*\bTarget="metadata\.xml"[^>]*\/>/.exec(originalRels);
+  const writtenRels = await writtenZip.file(workbookRelsPath)?.async('string');
+  if (relMatch && writtenRels && !/\bTarget="metadata\.xml"/.test(writtenRels)) {
+    const type = /\bType="([^"]*)"/.exec(relMatch[0])?.[1] ?? '';
+    const newRel = `<Relationship Id="${nextAvailableRelId(writtenRels)}" Type="${type}" Target="metadata.xml"/>`;
+    writtenZip.file(workbookRelsPath, writtenRels.replace('</Relationships>', `${newRel}</Relationships>`));
+  }
+}
+
+/**
+ * A defined name whose value is (or contains) `#REF!` points at a deleted sheet/range and can
+ * never resolve — dead weight, not something any of this module's edits could produce or fix.
+ * Confirmed on a real report: 21 of its 73 names (`LINKA10`..`LINKA30`, template artifacts from
+ * slots that were never used) were already dead in the *original* file. exceljs's writer happens
+ * to drop them anyway, but relying on that undocumented side effect meant Excel's own repair
+ * dialog was still the one "cleaning up" on open — do it ourselves, explicitly, instead.
+ */
+function stripDeadNamedRanges(workbookXml: string): string {
+  return workbookXml.replace(/<definedName\b[^>]*>[^<]*<\/definedName>/g, (tag) => (tag.includes('#REF!') ? '' : tag));
+}
+
+/** See this file's header comment. */
+async function reconcileWorkbookOutput(
+  originalBytes: Buffer,
+  writtenBytes: Buffer,
+  touchedSheetIds: ReadonlySet<number>,
+): Promise<Buffer> {
+  const originalZip = await JSZip.loadAsync(originalBytes);
+  const writtenZip = await JSZip.loadAsync(writtenBytes);
+
+  // Tables — never touched by this module's writes, always safe to restore verbatim.
+  for (const path of Object.keys(originalZip.files)) {
+    if (!/^xl\/tables\/.*\.xml$/.test(path) || !writtenZip.file(path)) continue;
+    writtenZip.file(path, await originalZip.file(path)!.async('nodebuffer'));
+  }
+  await restoreDroppedMetadataPart(originalZip, writtenZip);
+
+  // Shared strings: the original table is the base (its existing entries/indices never move),
+  // extended with anything genuinely new a touched sheet introduces.
+  const sharedTable = buildContentTable(
+    parseSharedStrings(await originalZip.file('xl/sharedStrings.xml')?.async('string')),
+  );
+  const writtenStringEntries = parseSharedStrings(await writtenZip.file('xl/sharedStrings.xml')?.async('string'));
+
+  // Styles: same "original is the base, touched sheets get remapped onto it" strategy — a
+  // touched sheet can legitimately need a style the original never had (e.g. a date-typed cell
+  // that was previously blank), so cellXfs/fonts/fills/borders/custom-numFmts are all
+  // canonicalized here too, not just restored blindly. xfId (named cell styles, cellStyleXfs) is
+  // NOT remapped — this module never applies one, and every plain-value write's xf keeps
+  // xfId="0" (the universal default), so that's a narrower, currently-unexercised residual gap.
+  const originalStylesXml = (await originalZip.file('xl/styles.xml')?.async('string')) ?? '';
+  const writtenStylesXml = (await writtenZip.file('xl/styles.xml')?.async('string')) ?? '';
+  const canonicalNumFmtIdByFormatCode = new Map<string, number>();
+  for (const [id, formatCode] of parseCustomNumFmts(originalStylesXml))
+    canonicalNumFmtIdByFormatCode.set(formatCode, id);
+  const nextCustomNumFmtId = { value: Math.max(164, ...canonicalNumFmtIdByFormatCode.values()) + 1 };
+  const writtenCustomNumFmts = parseCustomNumFmts(writtenStylesXml);
+  const canonicalFonts = buildContentTable(parseStyleSection(originalStylesXml, 'fonts', 'font'));
+  const writtenFonts = parseStyleSection(writtenStylesXml, 'fonts', 'font');
+  const canonicalFills = buildContentTable(parseStyleSection(originalStylesXml, 'fills', 'fill'));
+  const writtenFills = parseStyleSection(writtenStylesXml, 'fills', 'fill');
+  const canonicalBorders = buildContentTable(parseStyleSection(originalStylesXml, 'borders', 'border'));
+  const writtenBorders = parseStyleSection(writtenStylesXml, 'borders', 'border');
+  const canonicalXfs = buildContentTable(parseStyleSection(originalStylesXml, 'cellXfs', 'xf'));
+  const writtenXfs = parseStyleSection(writtenStylesXml, 'cellXfs', 'xf');
+
+  const originalPaths = await sheetIdToWorksheetPath(originalZip);
+  const writtenPaths = await sheetIdToWorksheetPath(writtenZip);
+
+  for (const [sheetId, originalPath] of originalPaths) {
+    const writtenPath = writtenPaths.get(sheetId);
+    if (!writtenPath) continue; // sheet no longer exists in the output — nothing to reconcile
+
+    if (touchedSheetIds.has(sheetId)) {
+      let sheetXml = await writtenZip.file(writtenPath)!.async('string');
+      sheetXml = remapSharedStringCells(sheetXml, writtenStringEntries, sharedTable);
+      sheetXml = remapCellStyles(
+        sheetXml,
+        writtenXfs,
+        canonicalXfs,
+        writtenCustomNumFmts,
+        canonicalNumFmtIdByFormatCode,
+        nextCustomNumFmtId,
+        writtenFonts,
+        canonicalFonts,
+        writtenFills,
+        canonicalFills,
+        writtenBorders,
+        canonicalBorders,
+      );
+      writtenZip.file(writtenPath, sheetXml);
+      continue;
+    }
+
+    // Untouched — restore verbatim (content + its own _rels, since hyperlink/table relationship
+    // ids are scoped to it), sidestepping every one of the round-trip bugs above on this sheet.
+    const originalFile = originalZip.file(originalPath);
+    if (!originalFile) continue;
+    writtenZip.file(writtenPath, await originalFile.async('nodebuffer'));
+
+    const originalRelsPath = originalPath.replace(/^xl\/worksheets\//, 'xl/worksheets/_rels/') + '.rels';
+    const writtenRelsPath = writtenPath.replace(/^xl\/worksheets\//, 'xl/worksheets/_rels/') + '.rels';
+    const originalRelsFile = originalZip.file(originalRelsPath);
+    if (originalRelsFile) {
+      writtenZip.file(writtenRelsPath, await originalRelsFile.async('nodebuffer'));
+    } else {
+      writtenZip.remove(writtenRelsPath); // original sheet had no rels — don't leave a stale written one behind
+    }
+  }
+
+  if (sharedTable.entries.length > 0) {
+    let totalRefs = 0;
+    for (const path of writtenPaths.values()) {
+      const file = writtenZip.file(path);
+      if (file) totalRefs += countSharedStringRefs(await file.async('string'));
+    }
+    writtenZip.file('xl/sharedStrings.xml', serializeSharedStrings(sharedTable, totalRefs));
+  }
+
+  if (originalStylesXml && writtenZip.file('xl/styles.xml')) {
+    writtenZip.file(
+      'xl/styles.xml',
+      serializeStyleSheet(
+        originalStylesXml,
+        canonicalNumFmtIdByFormatCode,
+        canonicalFonts,
+        canonicalFills,
+        canonicalBorders,
+        canonicalXfs,
+      ),
+    );
+  }
+
+  const workbookXml = await writtenZip.file('xl/workbook.xml')?.async('string');
+  if (workbookXml) {
+    const cleaned = stripDeadNamedRanges(workbookXml);
+    if (cleaned !== workbookXml) writtenZip.file('xl/workbook.xml', cleaned);
+  }
+
+  return writtenZip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
 
 function requireSheet(wb: Workbook, name: string): Worksheet {
@@ -154,9 +580,38 @@ function detectSlot(sheet: Worksheet): number | undefined {
   return Number.isInteger(slot) && slot >= 1 && slot <= NUM_EVENT_SLOTS ? slot : undefined;
 }
 
-/** Find the physical event sheet that currently owns a slot — by formula, not by name/position, so this keeps working after renaming/reordering. */
+/**
+ * Xternal (Excel's month-end finalize macro, not replicated here — see this
+ * file's header comment) bakes every event sheet's B3 anchor formula down to
+ * its evaluated date. Confirmed against a real "סופי" (finalized) report: B3
+ * was a plain Date on every event sheet, so `detectSlot`'s formula parse
+ * found nothing at all. Recover the slot by matching that baked date back to
+ * the driving table's own תאריך column, which Xternal leaves untouched.
+ * Ambiguous (two rows/sheets sharing a date) or unmatched dates return
+ * undefined rather than guessing.
+ */
+function detectSlotFromBakedDate(wb: Workbook, sheet: Worksheet): number | undefined {
+  const cellValue = sheet.getCell(SLOT_ANCHOR_CELL).value;
+  if (!(cellValue instanceof Date)) return undefined;
+  const summary = requireSheet(wb, SHEET.SUMMARY);
+  let match: number | undefined;
+  for (let slot = 1; slot <= NUM_EVENT_SLOTS; slot++) {
+    const rowDate = summary.getRow(SUMMARY_TABLE.firstDataRow + slot - 1).getCell(SUMMARY_TABLE.firstCol).value;
+    if (rowDate instanceof Date && rowDate.getTime() === cellValue.getTime()) {
+      if (match !== undefined) return undefined;
+      match = slot;
+    }
+  }
+  return match;
+}
+
+function detectSlotForSheet(wb: Workbook, sheet: Worksheet): number | undefined {
+  return detectSlot(sheet) ?? detectSlotFromBakedDate(wb, sheet);
+}
+
+/** Find the physical event sheet that currently owns a slot — by formula (or, for a finalized report, by baked date), not by name/position, so this keeps working after renaming/reordering. */
 function resolveEventSheetForSlot(wb: Workbook, slot: number): Worksheet {
-  const sheet = eventSheets(wb).find((s) => detectSlot(s) === slot);
+  const sheet = eventSheets(wb).find((s) => detectSlotForSheet(wb, s) === slot);
   if (!sheet) throw new MonthlyReportValidationError(`no event sheet currently resolves to slot ${slot}`);
   return sheet;
 }
@@ -387,16 +842,8 @@ function readEventDetails(sheet: Worksheet): Omit<MonthlyReportSnapshot['eventDe
   };
 }
 
-export async function readMonthlyReportFromBytes(
-  bytes: Buffer,
-  store?: AnonymizationStore,
-): Promise<MonthlyReportSnapshot> {
-  assertWithinSizeCap(bytes);
-  const wb = await loadWorkbook(bytes);
-  validateStructure(wb);
-
-  const slots = eventSheets(wb).map((sheet) => ({ slot: detectSlot(sheet) ?? null, name: sheet.name }));
-
+/** Every slot with at least one non-empty driving-table field — the single source of truth for "used", shared by the read snapshot and by autoFinalize's rename/reorder pass below. */
+function getUsedSummaryRows(wb: Workbook): MonthlyReportSnapshot['summaryRows'] {
   const summary = requireSheet(wb, SHEET.SUMMARY);
   const summaryRows: MonthlyReportSnapshot['summaryRows'] = [];
   for (let slot = 1; slot <= NUM_EVENT_SLOTS; slot++) {
@@ -410,6 +857,19 @@ export async function readMonthlyReportFromBytes(
     });
     if (hasValue) summaryRows.push({ slot, values });
   }
+  return summaryRows;
+}
+
+export async function readMonthlyReportFromBytes(
+  bytes: Buffer,
+  store?: AnonymizationStore,
+): Promise<MonthlyReportSnapshot> {
+  assertWithinSizeCap(bytes);
+  const wb = await loadWorkbook(bytes);
+  validateStructure(wb);
+
+  const slots = eventSheets(wb).map((sheet) => ({ slot: detectSlotForSheet(wb, sheet) ?? null, name: sheet.name }));
+  const summaryRows = getUsedSummaryRows(wb);
 
   const artistsSheet = requireSheet(wb, SHEET.ARTISTS);
   const artists: MonthlyReportSnapshot['artists'] = [];
@@ -470,11 +930,6 @@ export interface ArtistUpsert {
   email?: string;
 }
 
-export interface SheetRename {
-  from: string;
-  to: string;
-}
-
 export interface TicketLineInput {
   price?: string;
   quantity?: string;
@@ -512,11 +967,6 @@ export interface MonthlyReportChanges {
   artists?: ArtistUpsert[];
   eventRows?: EventRowInput[];
   eventSheetEdits?: EventSheetEdit[];
-  renameSheets?: SheetRename[];
-  /** Desired tab order for a subset of current event sheets; any event sheets not mentioned keep their existing relative order, appended after. */
-  reorderSheets?: string[];
-  /** Re-run the Que-equivalent sync (see runSync below) after the above. */
-  runSync?: boolean;
 }
 
 function upsertArtist(wb: Workbook, entry: ArtistUpsert, store?: AnonymizationStore): void {
@@ -632,19 +1082,6 @@ function writeEventSheetEdit(wb: Workbook, edit: EventSheetEdit): void {
   if (edit.ticketSummary) writeTicketSummary(sheet, edit.ticketSummary);
   if (edit.venuePayment) writeVenuePayment(sheet, edit.venuePayment);
   if (edit.note !== undefined) sheet.getCell(EVENT_NOTE_CELL).value = edit.note;
-}
-
-function renameSheet(wb: Workbook, rename: SheetRename): void {
-  const events = eventSheets(wb);
-  const sheet = events.find((s) => s.name === rename.from);
-  if (!sheet) throw new MonthlyReportValidationError(`"${rename.from}" is not a current event sheet`);
-  if (FIXED_SHEET_NAMES.includes(rename.to as (typeof FIXED_SHEET_NAMES)[number])) {
-    throw new MonthlyReportValidationError(`"${rename.to}" is a reserved sheet name`);
-  }
-  if (wb.getWorksheet(rename.to) && wb.getWorksheet(rename.to) !== sheet) {
-    throw new MonthlyReportValidationError(`a sheet named "${rename.to}" already exists`);
-  }
-  sheet.name = rename.to;
 }
 
 function reorderEventSheets(wb: Workbook, desiredOrder: string[]): void {
@@ -764,6 +1201,48 @@ function runQueSync(wb: Workbook): void {
   });
 }
 
+/** This workbook's own event-sheet naming convention — day unpadded, month zero-padded (matches every real sheet seen: "2.08", "11.08", "23.08"). */
+function dateToSheetName(date: Date): string {
+  return `${date.getUTCDate()}.${pad2(date.getUTCMonth() + 1)}`;
+}
+
+/** Appends " (2)", " (3)", ... until `base` doesn't collide with a different sheet — two events landing on the same date is rare but not impossible. */
+function uniqueSheetName(wb: Workbook, base: string, sheet: Worksheet): string {
+  let candidate = base;
+  for (let n = 2; wb.getWorksheet(candidate) && wb.getWorksheet(candidate) !== sheet; n++) {
+    candidate = `${base} (${n})`;
+  }
+  return candidate;
+}
+
+/**
+ * Replaces the old agent-driven renameSheets/reorderSheets/runSync trio — called unconditionally
+ * at the end of every apply, so the agent never has to sequence these itself. For every used slot
+ * with a parseable תאריך, renames its event sheet to match (skipping slots with no date yet —
+ * they keep their placeholder "אירוע<slot>" name) and reorders all dated event sheets
+ * chronologically (undated/unused ones keep their existing relative order, appended after — see
+ * reorderEventSheets). Always re-syncs הוצאות via runQueSync afterward.
+ */
+function autoFinalize(wb: Workbook): void {
+  const dated: { name: string; date: Date }[] = [];
+
+  for (const { slot, values } of getUsedSummaryRows(wb)) {
+    const parsed = parseSummaryCellValue(DATE_COLUMN, values[DATE_COLUMN]);
+    if (!(parsed instanceof Date)) continue; // no parseable date yet — leave this slot's sheet name alone
+    const sheet = resolveEventSheetForSlot(wb, slot);
+    const targetName = dateToSheetName(parsed);
+    if (sheet.name !== targetName) sheet.name = uniqueSheetName(wb, targetName, sheet);
+    dated.push({ name: sheet.name, date: parsed });
+  }
+
+  dated.sort((a, b) => a.date.getTime() - b.date.getTime());
+  reorderEventSheets(
+    wb,
+    dated.map((d) => d.name),
+  );
+  runQueSync(wb);
+}
+
 /** Apply a batch of changes and return the new workbook bytes. Verifies everything before writing anything, same discipline as excel-reports.ts. */
 export async function applyMonthlyReportChangesToBytes(
   bytes: Buffer,
@@ -787,16 +1266,20 @@ export async function applyMonthlyReportChangesToBytes(
   for (const entry of changes.artists ?? []) {
     if (!entry.name.trim()) throw new MonthlyReportValidationError('artist name is required');
   }
-  // Resolving up front (and discarding the result) keeps the "verify everything before writing
-  // anything" invariant — a bad slot in a later edit must never leave an earlier one half-applied.
-  for (const edit of changes.eventSheetEdits ?? []) resolveEventSheetForSlot(wb, edit.slot);
+  // Resolving up front (rather than discarding the result) both keeps the "verify everything
+  // before writing anything" invariant — a bad slot in a later edit must never leave an earlier
+  // one half-applied — and doubles as the touched-sheet tracking restoreUntouchedWorksheets needs.
+  const touchedSheetIds = new Set<number>();
+  for (const edit of changes.eventSheetEdits ?? []) touchedSheetIds.add(resolveEventSheetForSlot(wb, edit.slot).id);
+  if (changes.artists?.length) touchedSheetIds.add(requireSheet(wb, SHEET.ARTISTS).id);
+  if (changes.eventRows?.length) touchedSheetIds.add(requireSheet(wb, SHEET.SUMMARY).id);
+  touchedSheetIds.add(requireSheet(wb, SHEET.EXPENSE).id); // autoFinalize always re-syncs it below
 
   for (const entry of changes.artists ?? []) upsertArtist(wb, entry, store);
   for (const input of changes.eventRows ?? []) writeEventRow(wb, input);
   for (const edit of changes.eventSheetEdits ?? []) writeEventSheetEdit(wb, edit);
-  for (const rename of changes.renameSheets ?? []) renameSheet(wb, rename);
-  if (changes.reorderSheets) reorderEventSheets(wb, changes.reorderSheets);
-  if (changes.runSync) runQueSync(wb);
+  autoFinalize(wb);
 
-  return Buffer.from(await wb.xlsx.writeBuffer());
+  const written = Buffer.from(await wb.xlsx.writeBuffer());
+  return reconcileWorkbookOutput(bytes, written, touchedSheetIds);
 }

@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { describe, expect, it } from 'vitest';
 
 import { AnonymizationStore, anonymizeCellValue, deanonymizeText } from './anonymize.js';
@@ -99,21 +100,39 @@ describe('readMonthlyReportFromBytes', () => {
     ]);
   });
 
-  it('reports the correct slot per sheet even after tabs have been reordered — regression test: slot must never be inferred from tab position once reordering has happened, because it stops matching (found by cross-checking against a real Idan-filled-and-reordered report)', async () => {
+  it('reports the correct slot per sheet even after autoFinalize has reordered tabs — regression test: slot must never be inferred from tab position once reordering has happened, because it stops matching (found by cross-checking against a real Idan-filled-and-reordered report)', async () => {
     const bytes = await buildWorkbook({ numEventSheets: 3 });
-    const renamed = await applyMonthlyReportChangesToBytes(bytes, {
-      renameSheets: [
-        { from: 'אירוע1', to: '20.08' },
-        { from: 'אירוע2', to: '5.08' },
+    const values1 = SUMMARY_HEADERS.map(() => '');
+    values1[0] = '20/08/2026';
+    const values2 = SUMMARY_HEADERS.map(() => '');
+    values2[0] = '5/08/2026';
+    // autoFinalize reorders chronologically — slot-2 sheet ("5.08") ends up before slot-1 sheet ("20.08").
+    const out = await applyMonthlyReportChangesToBytes(bytes, {
+      eventRows: [
+        { slot: 1, values: values1 },
+        { slot: 2, values: values2 },
       ],
     });
-    // Reorder puts slot-2 sheet ("5.08") before slot-1 sheet ("20.08") in tab order.
-    const out = await applyMonthlyReportChangesToBytes(renamed, { reorderSheets: ['5.08', '20.08'] });
     const snap = await readMonthlyReportFromBytes(out);
     expect(snap.eventSheets).toEqual([
       { slot: 2, name: '5.08' },
       { slot: 1, name: '20.08' },
       { slot: 3, name: 'אירוע3' },
+    ]);
+  });
+
+  it("falls back to the sheet's baked B3 date when its row-anchor formula is gone — regression test: a real finalized (\"סופי\") report has every event sheet's B3 baked to a plain Date by Excel's own finalize macro, so the formula-based slot parse finds nothing at all (found via gmail_read_monthly_report failing on a real finalized report)", async () => {
+    const bytes = await buildWorkbook({ numEventSheets: 2 });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(bytes as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+    wb.getWorksheet('סיכום חודשי')!.getRow(47).getCell(4).value = new Date(Date.UTC(2026, 7, 11));
+    wb.getWorksheet('אירוע1')!.getCell('B3').value = new Date(Date.UTC(2026, 7, 11));
+    const baked = Buffer.from(await wb.xlsx.writeBuffer());
+
+    const snap = await readMonthlyReportFromBytes(baked);
+    expect(snap.eventSheets).toEqual([
+      { slot: 1, name: 'אירוע1' }, // B3 baked to a value — resolved by matching it back to row 47's own date
+      { slot: 2, name: 'אירוע2' }, // untouched — still resolved by its live formula, as before
     ]);
   });
 
@@ -226,61 +245,69 @@ describe('applyMonthlyReportChangesToBytes — artists', () => {
   });
 });
 
-describe('applyMonthlyReportChangesToBytes — renameSheets / reorderSheets', () => {
-  it('renames an event sheet and keeps it recognized by position', async () => {
+describe('applyMonthlyReportChangesToBytes — autoFinalize (automatic rename/reorder)', () => {
+  it("auto-renames a used slot's event sheet to its own תאריך, in d.mm form", async () => {
     const bytes = await buildWorkbook({ numEventSheets: 2 });
-    const out = await applyMonthlyReportChangesToBytes(bytes, { renameSheets: [{ from: 'אירוע1', to: '6.08' }] });
+    const values = SUMMARY_HEADERS.map(() => '');
+    values[0] = '6/08/2026';
+    const out = await applyMonthlyReportChangesToBytes(bytes, { eventRows: [{ slot: 1, values }] });
     const snap = await readMonthlyReportFromBytes(out);
     expect(snap.eventSheets).toEqual([
       { slot: 1, name: '6.08' },
-      { slot: 2, name: 'אירוע2' },
+      { slot: 2, name: 'אירוע2' }, // no date yet — kept as the placeholder
     ]);
   });
 
-  it('rejects renaming a sheet that is not a current event sheet', async () => {
-    const bytes = await buildWorkbook();
-    await expect(
-      applyMonthlyReportChangesToBytes(bytes, { renameSheets: [{ from: 'סיכום חודשי', to: 'x' }] }),
-    ).rejects.toThrow(MonthlyReportValidationError);
+  it('leaves a slot with no parseable date alone', async () => {
+    const bytes = await buildWorkbook({ numEventSheets: 1 });
+    const out = await applyMonthlyReportChangesToBytes(bytes, {
+      artists: [{ name: 'אמן חדש' }], // an edit that doesn't touch eventRows at all
+    });
+    const snap = await readMonthlyReportFromBytes(out);
+    expect(snap.eventSheets).toEqual([{ slot: 1, name: 'אירוע1' }]);
   });
 
-  it('rejects renaming into a reserved fixed sheet name', async () => {
-    const bytes = await buildWorkbook();
-    await expect(
-      applyMonthlyReportChangesToBytes(bytes, { renameSheets: [{ from: 'אירוע1', to: 'הכנסות' }] }),
-    ).rejects.toThrow(MonthlyReportValidationError);
-  });
-
-  it('reorders a subset of event sheets, appending the rest afterward in their existing order', async () => {
+  it('reorders all dated event sheets chronologically, appending undated/unused ones after in their existing order', async () => {
     const bytes = await buildWorkbook({ numEventSheets: 3 });
-    const renamed = await applyMonthlyReportChangesToBytes(bytes, {
-      renameSheets: [
-        { from: 'אירוע1', to: '20.08' },
-        { from: 'אירוע2', to: '5.08' },
+    const values1 = SUMMARY_HEADERS.map(() => '');
+    values1[0] = '20/08/2026';
+    const values2 = SUMMARY_HEADERS.map(() => '');
+    values2[0] = '5/08/2026';
+    const out = await applyMonthlyReportChangesToBytes(bytes, {
+      eventRows: [
+        { slot: 1, values: values1 },
+        { slot: 2, values: values2 },
       ],
     });
-    const out = await applyMonthlyReportChangesToBytes(renamed, { reorderSheets: ['5.08', '20.08'] });
     const snap = await readMonthlyReportFromBytes(out);
     expect(snap.eventSheets.map((s) => s.name)).toEqual(['5.08', '20.08', 'אירוע3']);
   });
 
-  it('rejects reordering a sheet name that does not currently exist', async () => {
+  it('disambiguates two events landing on the same date rather than throwing', async () => {
     const bytes = await buildWorkbook({ numEventSheets: 2 });
-    await expect(applyMonthlyReportChangesToBytes(bytes, { reorderSheets: ['not-a-sheet'] })).rejects.toThrow(
-      MonthlyReportValidationError,
-    );
+    const values1 = SUMMARY_HEADERS.map(() => '');
+    values1[0] = '6/08/2026';
+    const values2 = SUMMARY_HEADERS.map(() => '');
+    values2[0] = '6/08/2026';
+    const out = await applyMonthlyReportChangesToBytes(bytes, {
+      eventRows: [
+        { slot: 1, values: values1 },
+        { slot: 2, values: values2 },
+      ],
+    });
+    const snap = await readMonthlyReportFromBytes(out);
+    expect(snap.eventSheets.map((s) => s.name).sort()).toEqual(['6.08', '6.08 (2)']);
   });
 });
 
-describe('applyMonthlyReportChangesToBytes — runSync (Que port)', () => {
-  it('Sheetsplace: syncs הוצאות row2 to current event sheet names in tab order', async () => {
+describe('applyMonthlyReportChangesToBytes — auto-sync (Que port, now always-on)', () => {
+  it('Sheetsplace: syncs הוצאות row2 to current (auto-renamed) event sheet names in tab order', async () => {
     const bytes = await buildWorkbook({ numEventSheets: 2 });
-    const renamed = await applyMonthlyReportChangesToBytes(bytes, {
-      renameSheets: [{ from: 'אירוע1', to: '6.08' }],
-      runSync: true,
-    });
+    const values = SUMMARY_HEADERS.map(() => '');
+    values[0] = '6/08/2026';
+    const out = await applyMonthlyReportChangesToBytes(bytes, { eventRows: [{ slot: 1, values }] });
     const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(renamed as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+    await wb.xlsx.load(out as any); // eslint-disable-line @typescript-eslint/no-explicit-any
     const expenseRow2 = wb.getWorksheet('הוצאות')!.getRow(2);
     expect(expenseRow2.getCell(8).text).toBe('6.08'); // H
     expect(expenseRow2.getCell(9).text).toBe('אירוע2'); // I
@@ -296,7 +323,7 @@ describe('applyMonthlyReportChangesToBytes — runSync (Que port)', () => {
     eventSheet.getRow(11).getCell(5).value = 500; // E: fee > 0
     const withEvent = Buffer.from(await wb.xlsx.writeBuffer());
 
-    const out = await applyMonthlyReportChangesToBytes(withEvent, { runSync: true });
+    const out = await applyMonthlyReportChangesToBytes(withEvent, {});
     const snap = await readMonthlyReportFromBytes(out);
     expect(snap.artists.some((a) => a.name === 'אמן לא רשום')).toBe(false); // added to הוצאות, not פרטי_אמנים
     const outWb = new ExcelJS.Workbook();
@@ -319,7 +346,7 @@ describe('applyMonthlyReportChangesToBytes — runSync (Que port)', () => {
     eventSheet.getRow(11).getCell(5).value = 0; // fee not > 0
     const withEvent = Buffer.from(await wb.xlsx.writeBuffer());
 
-    const out = await applyMonthlyReportChangesToBytes(withEvent, { runSync: true });
+    const out = await applyMonthlyReportChangesToBytes(withEvent, {});
     const outWb = new ExcelJS.Workbook();
     await outWb.xlsx.load(out as any); // eslint-disable-line @typescript-eslint/no-explicit-any
     const names: string[] = [];
@@ -332,7 +359,7 @@ describe('applyMonthlyReportChangesToBytes — runSync (Que port)', () => {
 
   it('Byname: sorts the expense artist_name column', async () => {
     const bytes = await buildWorkbook(); // 'זיו הרמלין-שדר', 'סטודיו' pre-seeded, out of order
-    const out = await applyMonthlyReportChangesToBytes(bytes, { runSync: true });
+    const out = await applyMonthlyReportChangesToBytes(bytes, {});
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(out as any); // eslint-disable-line @typescript-eslint/no-explicit-any
     const names = [
@@ -374,7 +401,8 @@ describe('applyMonthlyReportChangesToBytes — eventSheetEdits (ticket summary /
 
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(out as any); // eslint-disable-line @typescript-eslint/no-explicit-any
-    const priceCell = wb.getWorksheet('אירוע1')!.getRow(58).getCell(3);
+    // buildWorkbookWithUsedSlot1's own eventRows write (תאריך 11/08/2026) already auto-renamed this sheet.
+    const priceCell = wb.getWorksheet('11.08')!.getRow(58).getCell(3);
     expect(typeof priceCell.value).toBe('number'); // real number, not text, matches the template's own sample values
   });
 
@@ -411,8 +439,8 @@ describe('applyMonthlyReportChangesToBytes — eventSheetEdits (ticket summary /
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(out as any); // eslint-disable-line @typescript-eslint/no-explicit-any
     // title sets both A34 and B34, matching the real template's own A34/B34 pair.
-    expect(wb.getWorksheet('אירוע1')!.getRow(34).getCell(1).text).toBe('סיכום הכנסות');
-    expect(wb.getWorksheet('אירוע1')!.getRow(34).getCell(2).text).toBe('סיכום הכנסות');
+    expect(wb.getWorksheet('11.08')!.getRow(34).getCell(1).text).toBe('סיכום הכנסות');
+    expect(wb.getWorksheet('11.08')!.getRow(34).getCell(2).text).toBe('סיכום הכנסות');
   });
 
   it('rejects more venuePayment rows/columns than the block has', async () => {
@@ -433,10 +461,24 @@ describe('applyMonthlyReportChangesToBytes — eventSheetEdits (ticket summary /
     expect(snap.eventDetails.find((d) => d.slot === 1)!.note).toBe("נא לציין מס' הזמנת רכש 4502754930");
   });
 
-  it('targets the right physical sheet by slot even after it has been renamed', async () => {
+  it('still targets slot 1 for writing once its row-anchor formula has been baked to a value — regression test, see the matching readMonthlyReportFromBytes test', async () => {
     const bytes = await buildWorkbookWithUsedSlot1();
-    const renamed = await applyMonthlyReportChangesToBytes(bytes, { renameSheets: [{ from: 'אירוע1', to: '11.08' }] });
-    const out = await applyMonthlyReportChangesToBytes(renamed, {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(bytes as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+    wb.getWorksheet('11.08')!.getCell('B3').value = new Date(Date.UTC(2026, 7, 11));
+    const baked = Buffer.from(await wb.xlsx.writeBuffer());
+
+    const out = await applyMonthlyReportChangesToBytes(baked, {
+      eventSheetEdits: [{ slot: 1, note: 'baked-slot note' }],
+    });
+    const snap = await readMonthlyReportFromBytes(out);
+    expect(snap.eventDetails.find((d) => d.slot === 1)!.note).toBe('baked-slot note');
+  });
+
+  it('targets the right physical sheet by slot even after autoFinalize has renamed it', async () => {
+    // buildWorkbookWithUsedSlot1's own eventRows write already auto-renamed אירוע1 to 11.08.
+    const bytes = await buildWorkbookWithUsedSlot1();
+    const out = await applyMonthlyReportChangesToBytes(bytes, {
       eventSheetEdits: [{ slot: 1, note: 'after rename' }],
     });
     const wb = new ExcelJS.Workbook();
@@ -453,4 +495,147 @@ describe('applyMonthlyReportChangesToBytes — eventSheetEdits (ticket summary /
       }),
     ).rejects.toThrow(MonthlyReportValidationError);
   });
+});
+
+describe('applyMonthlyReportChangesToBytes — Excel Table preservation', () => {
+  it(
+    "restores an Excel Table's columns verbatim across a write — regression test: exceljs's own " +
+      "load→writeBuffer silently truncates tableColumns (desyncing them from the table's own ref " +
+      'range — an inconsistency Excel cannot open without "repairing" by deleting the Table/AutoFilter ' +
+      'outright) whenever a column carries a calculatedColumnFormula, which real Idan-filled reports do ' +
+      "(found via Excel's repair dialog on a report Jarvis had just edited)",
+    async () => {
+      const bytes = await buildWorkbook();
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.load(bytes as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+      wb.getWorksheet('הכנסות')!.addTable({
+        name: 'income',
+        ref: 'A1',
+        headerRow: true,
+        columns: [{ name: 'a' }, { name: 'b' }, { name: 'c' }],
+        rows: [
+          [1, 2, 3],
+          [4, 5, 6],
+        ],
+      });
+      const withTable = Buffer.from(await wb.xlsx.writeBuffer());
+
+      // Inject a calculatedColumnFormula into column 2 (the shape exceljs's TableColumnXform can't
+      // round-trip — its parseClose() never signals "done" on an unrecognized child element, which
+      // desyncs the parser for every column after it) and drop the autoFilter's own filterColumn
+      // children, matching a real Excel-authored table (exceljs's own addTable adds them; Excel
+      // itself, and the real corrupted report, do not) — otherwise TableXform's own reconciliation
+      // between the (now-desynced) column list and the autoFilter's column list throws outright
+      // instead of silently truncating, which is a distinct exceljs bug from the one under test.
+      const zip = await JSZip.loadAsync(withTable);
+      const tableXml = await zip.file('xl/tables/table1.xml')!.async('string');
+      const injected = tableXml
+        .replace(
+          /<tableColumn id="2"[^/]*\/>/,
+          '<tableColumn id="2" name="b"><calculatedColumnFormula>A1</calculatedColumnFormula></tableColumn>',
+        )
+        .replace(/<autoFilter ref="A1:C3">.*?<\/autoFilter>/, '<autoFilter ref="A1:C3"/>');
+      expect(injected).not.toBe(tableXml); // sanity: both injections actually matched something
+      zip.file('xl/tables/table1.xml', injected);
+      const source = await zip.generateAsync({ type: 'nodebuffer' });
+
+      // Sanity check: exceljs really does corrupt this on a bare round trip (i.e. this test would
+      // catch exceljs fixing the bug upstream just as readily as it catches our fix regressing).
+      const bareWb = new ExcelJS.Workbook();
+      await bareWb.xlsx.load(source as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+      const bareOut = Buffer.from(await bareWb.xlsx.writeBuffer());
+      const bareTableXml = await (await JSZip.loadAsync(bareOut)).file('xl/tables/table1.xml')!.async('string');
+      expect(bareTableXml).not.toContain('tableColumns count="3"');
+
+      const out = await applyMonthlyReportChangesToBytes(source, {});
+      const outTableXml = await (await JSZip.loadAsync(out)).file('xl/tables/table1.xml')!.async('string');
+      expect(outTableXml).toBe(injected);
+    },
+  );
+
+  it(
+    'restores xl/metadata.xml (and its Content_Types/workbook.xml.rels wiring) when a cell references it — regression ' +
+      'test: exceljs\'s writer drops the part entirely but leaves cm="N" cell-metadata attributes in place, which Excel ' +
+      'treats as a dangling reference and repairs ("Cell information") — found on a real report\'s array-formula-heavy ' +
+      'sheets (~940 affected cells)',
+    async () => {
+      const bytes = await buildWorkbook();
+      const zip = await JSZip.loadAsync(bytes);
+
+      // Inject a minimal xl/metadata.xml, fully wired in (Content_Types override, workbook.xml.rels
+      // relationship, and a cm="1" attribute on one הכנסות cell), mirroring the real file's shape.
+      const metadataXml =
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+        '<metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000"/></metadataTypes>' +
+        '<futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/09/main" fCollapsed="1"/></ext></extLst></bk></futureMetadata>' +
+        '<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata>' +
+        '</metadata>';
+      zip.file('xl/metadata.xml', metadataXml);
+
+      const contentTypes = await zip.file('[Content_Types].xml')!.async('string');
+      zip.file(
+        '[Content_Types].xml',
+        contentTypes.replace(
+          '</Types>',
+          '<Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>',
+        ),
+      );
+
+      const workbookRels = await zip.file('xl/_rels/workbook.xml.rels')!.async('string');
+      zip.file(
+        'xl/_rels/workbook.xml.rels',
+        workbookRels.replace(
+          '</Relationships>',
+          '<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/></Relationships>',
+        ),
+      );
+
+      const incomeSheetXml = await zip.file('xl/worksheets/sheet1.xml')!.async('string');
+      zip.file(
+        'xl/worksheets/sheet1.xml',
+        incomeSheetXml.replace('<sheetData/>', '<sheetData><row r="1"><c r="A1" cm="1"><v>1</v></c></row></sheetData>'),
+      );
+
+      const source = await zip.generateAsync({ type: 'nodebuffer' });
+
+      // Sanity check: exceljs really does drop the part on a bare round trip.
+      const bareWb = new ExcelJS.Workbook();
+      await bareWb.xlsx.load(source as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+      const bareOut = Buffer.from(await bareWb.xlsx.writeBuffer());
+      expect((await JSZip.loadAsync(bareOut)).file('xl/metadata.xml')).toBeNull();
+
+      const out = await applyMonthlyReportChangesToBytes(source, {});
+      const outZip = await JSZip.loadAsync(out);
+      expect(await outZip.file('xl/metadata.xml')?.async('string')).toBe(metadataXml);
+      expect(await outZip.file('[Content_Types].xml')!.async('string')).toContain('/xl/metadata.xml');
+      expect(await outZip.file('xl/_rels/workbook.xml.rels')!.async('string')).toContain('Target="metadata.xml"');
+    },
+  );
+
+  it(
+    'drops defined names that already point at #REF!, keeping live ones — regression test: a real report ' +
+      "carried 21 such names (LINKA10..LINKA30, template artifacts from never-used slots) that Excel's own " +
+      'repair dialog flagged as "Removed Records: Named range" on every open, even though they were already ' +
+      'dead in the original file — clean them up ourselves rather than leave it to Excel',
+    async () => {
+      const bytes = await buildWorkbook();
+      const zip = await JSZip.loadAsync(bytes);
+      const workbookXml = await zip.file('xl/workbook.xml')!.async('string');
+      zip.file(
+        'xl/workbook.xml',
+        workbookXml.replace(
+          '<calcPr',
+          '<definedNames><definedName name="LINKA10">#REF!</definedName><definedName name="LinkA1">אירוע1!$A$1</definedName></definedNames><calcPr',
+        ),
+      );
+      const source = await zip.generateAsync({ type: 'nodebuffer' });
+
+      const out = await applyMonthlyReportChangesToBytes(source, {});
+      const outWorkbookXml = await (await JSZip.loadAsync(out)).file('xl/workbook.xml')!.async('string');
+      expect(outWorkbookXml).not.toContain('LINKA10');
+      expect(outWorkbookXml).not.toContain('#REF!');
+      expect(outWorkbookXml).toContain('<definedName name="LinkA1">');
+    },
+  );
 });

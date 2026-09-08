@@ -72,9 +72,7 @@ async function handleMonthlyReportApply(req: http.IncomingMessage, res: http.Ser
     newBytes = await applyMonthlyReportChangesToBytes(bytes, {
       artists: body.artists,
       eventRows: body.eventRows,
-      renameSheets: body.renameSheets,
-      reorderSheets: body.reorderSheets,
-      runSync: body.runSync,
+      eventSheetEdits: body.eventSheetEdits,
     });
   } catch (err) {
     sendMonthlyReportError(res, err);
