@@ -916,6 +916,43 @@ export async function readMonthlyReportFromBytes(
   return { eventSheets: slots, summaryRows, artists, monthlies, eventDetails };
 }
 
+export interface ArtistPaymentRow {
+  name: string;
+  email: string;
+  payeeName: string;
+  payeeEmail: string;
+  amount: string;
+}
+
+/**
+ * Raw (never anonymized) artist rows, for the artist-payment-drafts mail-merge pipeline only —
+ * that pipeline runs entirely inside this process and creates Gmail drafts directly, so it needs
+ * real email addresses, unlike readMonthlyReportFromBytes above (whose output is meant for the
+ * agent's eyes and anonymizes email/id/status columns). Do not reuse this for anything that
+ * returns to the container.
+ */
+export async function readArtistPaymentRowsFromBytes(bytes: Buffer): Promise<ArtistPaymentRow[]> {
+  assertWithinSizeCap(bytes);
+  const wb = await loadWorkbook(bytes);
+  validateStructure(wb);
+
+  const artistsSheet = requireSheet(wb, SHEET.ARTISTS);
+  const rows: ArtistPaymentRow[] = [];
+  for (let r = ARTISTS.headerRow + 1; r <= artistsSheet.rowCount; r++) {
+    const row = artistsSheet.getRow(r);
+    const name = safeCellText(row.getCell(ARTISTS.nameCol)).trim();
+    if (!name) continue;
+    rows.push({
+      name,
+      email: safeCellText(row.getCell(ARTISTS.sensitiveCols.email)).trim(),
+      payeeName: safeCellText(row.getCell(7)).trim(),
+      payeeEmail: safeCellText(row.getCell(9)).trim(),
+      amount: safeCellText(row.getCell(10)).trim(),
+    });
+  }
+  return rows;
+}
+
 export interface EventRowInput {
   /** 1..30 — row 46+slot in סיכום חודשי, and (before any renaming this session) the sheet currently named `אירוע<slot>`. */
   slot: number;

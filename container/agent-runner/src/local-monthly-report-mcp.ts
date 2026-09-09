@@ -1,7 +1,7 @@
 /**
  * Local report MCP tools — install-specific, loaded automatically by
  * gmail-mcp-stdio.ts's local report tool hook (see its module comment).
- * Mirrors src/gmail-sanitizer/local-report-extension.ts's two routes as
+ * Mirrors src/gmail-sanitizer/local-report-extension.ts's routes as
  * agent-facing tools; this file is the only place that knows they exist.
  *
  * The agent only ever sees CSVs — this file is the translation boundary.
@@ -12,6 +12,12 @@
  * them. The host's own write path (src/gmail-sanitizer/monthly-report.ts)
  * now auto-renames/reorders event sheets and re-syncs הוצאות on every
  * apply, so this layer never needs to think about sheet identity either.
+ *
+ * `gmail_create_artist_payment_drafts` is different in kind: it triggers a
+ * fully scripted mail-merge that runs entirely on the host (see
+ * artist-payment-drafts.ts) — this tool passes through no email content and
+ * gets none back, only a per-artist name/amount/status summary. Nothing
+ * about wording is ever composed by the agent.
  */
 import fs from 'fs/promises';
 import path from 'path';
@@ -134,6 +140,40 @@ export function registerTools(server: McpServer): void {
               .join('\n')}`
           : '';
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) + assignmentsText }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    'gmail_create_artist_payment_drafts',
+    "Bulk-create one Gmail draft per artist for their monthly payment, using Idan's report and his editable template at groups/jarvis/templates/artist-payment-email.md — NEVER sends anything, only saves to Drafts. This is a fully scripted mail-merge: you never see or write any part of the email's subject/body, and this tool never returns one either — only a per-artist name/amount/status list, so no email content or address ever passes through you. Skips (and reports, with a reason) any artist with a blank/zero amount or no email on file. `dryRun` defaults to true — run it that way first and read back the list of who would get a draft and for how much before setting `dryRun: false` to actually create them; use `onlyArtist` to test a single artist end-to-end first. If Idan wants the wording changed, tell him to edit the template file directly — that's not something you do for him.",
+    {
+      ...sourceSchema,
+      dryRun: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Preview only (default true) — no drafts are created. Pass false to actually create them.'),
+      onlyArtist: z.string().optional().describe('Limit to one artist by their exact name in the report, for testing before running the full batch'),
+    },
+    async (args) => {
+      log(`Creating artist payment drafts${args.driveFileId ? ` (drive:${args.driveFileId})` : ''}${args.dryRun ? ' [dry run]' : ''}${args.onlyArtist ? ` [only: ${args.onlyArtist}]` : ''}`);
+      try {
+        const res = await sanitizerFetch('/monthly-report/create-artist-payment-drafts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(args),
+        });
+        if (!res.ok) {
+          return { content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }], isError: true };
+        }
+        const result = await res.json();
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
         return {
           content: [{ type: 'text' as const, text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}` }],
