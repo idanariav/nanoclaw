@@ -37,6 +37,13 @@ const ACTIVE_POLL_INTERVAL_MS = 500;
 /** Consecutive driver-classified failures before a fresh runner is required. */
 const MAILBOX_FAILURE_STREAK_EXIT = 10;
 
+/**
+ * Off by default so existing installs see no change in chat volume. Set via
+ * the host's NANOCLAW_DELIVER_PROGRESS_EVENTS env var (src/config.ts),
+ * threaded into the container's own env by composeSessionSpec.
+ */
+const DELIVER_PROGRESS_EVENTS = process.env.NANOCLAW_DELIVER_PROGRESS_EVENTS === 'true';
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -546,6 +553,13 @@ export async function processQuery(
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
         }
+      } else if (event.type === 'progress') {
+        // Optional visibility into long-running turns (see
+        // DELIVER_PROGRESS_EVENTS above). Chat runs only — task runs stay
+        // one-door (the send_message tool is the only delivery path there).
+        if (DELIVER_PROGRESS_EVENTS && !routing.taskRun) {
+          await deliverProgressEvent(event.message, routing);
+        }
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -697,6 +711,27 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This is the same user-facing write the outer catch block does, minus the
  * `Error:` prefix — the provider's text is already a user-facing message.
  */
+/**
+ * Deliver a mid-turn progress notification (DELIVER_PROGRESS_EVENTS only) as
+ * a lightweight status message. `kind: 'progress'` — deliberately distinct
+ * from 'chat' — so the host's cross-session-context module never fans it
+ * into sibling sessions or replays it into a new sibling session's backfill
+ * prelude as ambient "you said" history (src/modules/cross-session-context/
+ * fan.ts, src/mailbox/sqlite/index.ts getTopLevelOutbound): it's ephemeral,
+ * for-the-human-only chatter, not part of the durable conversation record.
+ */
+async function deliverProgressEvent(text: string, routing: RoutingContext): Promise<void> {
+  await writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'progress',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
+}
+
 async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
   await writeMessageOut({

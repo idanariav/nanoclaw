@@ -21,6 +21,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
+  'NANOCLAW_DELIVER_PROGRESS_EVENTS',
 ]);
 
 /**
@@ -112,6 +113,15 @@ export const EGRESS_NETWORK =
   process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
 export const ONECLI_GATEWAY_CONTAINER =
   process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
+
+// Deliver mid-turn 'progress' provider events (e.g. background task-notification
+// summaries) to the user as a lightweight status message, instead of only
+// logging them container-side. Off by default so existing installs see no
+// change in chat volume; the container reads this via its own env (threaded
+// through composeSessionSpec in container-runner.ts).
+export const DELIVER_PROGRESS_EVENTS =
+  (process.env.NANOCLAW_DELIVER_PROGRESS_EVENTS || envConfig.NANOCLAW_DELIVER_PROGRESS_EVENTS || '').toLowerCase() ===
+  'true';
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

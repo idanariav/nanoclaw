@@ -249,7 +249,9 @@ export async function fanOutboundMessage(
   agentGroup: AgentGroup,
 ): Promise<number> {
   try {
-    if (msg.kind === 'system' || msg.kind === 'task_log') return 0;
+    // 'progress' rows are ephemeral status pings (see poll-loop.ts
+    // deliverProgressEvent) — never fan them into sibling sessions.
+    if (msg.kind === 'system' || msg.kind === 'task_log' || msg.kind === 'progress') return 0;
     if (!msg.channel_type || !msg.platform_id) return 0;
     if (msg.channel_type === 'agent' || msg.channel_type === ECHO_CHANNEL_TYPE) return 0;
     const isTaskSource = isTaskThread(session.thread_id);

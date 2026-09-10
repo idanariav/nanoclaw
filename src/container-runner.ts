@@ -20,6 +20,7 @@ import {
   CONTAINER_MEMORY_LIMIT,
   CONTAINER_PIDS_LIMIT,
   DATA_DIR,
+  DELIVER_PROGRESS_EVENTS,
   GROUPS_DIR,
   INSTALL_SLUG,
   TIMEZONE,
@@ -967,6 +968,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
 
   const env: Record<string, string> = {
     TZ: containerConfig.timezone ?? TIMEZONE,
+    NANOCLAW_DELIVER_PROGRESS_EVENTS: DELIVER_PROGRESS_EVENTS ? 'true' : 'false',
     ...mailboxEnvironment,
   };
   // The contributed lane (ContainerSpec.contributedEnv): registry-sourced env,

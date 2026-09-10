@@ -409,7 +409,7 @@ export function wrapSqliteOutbound(
       (
         readable()
           .prepare(
-            "SELECT timestamp, content FROM messages_out WHERE kind NOT IN ('system','task_log') " +
+            "SELECT timestamp, content FROM messages_out WHERE kind NOT IN ('system','task_log','progress') " +
               "AND (channel_type IS NULL OR channel_type != 'agent') " +
               "AND (thread_id IS NULL OR thread_id = '' OR thread_id LIKE '%:') " +
               'ORDER BY seq DESC LIMIT ?',
