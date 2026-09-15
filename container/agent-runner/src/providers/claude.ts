@@ -19,6 +19,7 @@ import {
 // read the SDK's on-disk .jsonl, which no other provider has.
 import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
 import { registerProvider } from './provider-registry.js';
+import { describeToolUse } from './tool-progress.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 function log(msg: string): void {
@@ -313,14 +314,28 @@ export class ClaudeProvider implements AgentProvider {
           // result reports. Blocks split across ASSISTANT MESSAGES (a tool
           // call between them) remain unparseable mid-turn by design; the
           // poll-loop's midTurnSent===0 fallback and wrap-nudge cover that.
-          const content = (message as { message?: { content?: Array<{ type?: string; text?: string }> } }).message
-            ?.content;
+          const content = (
+            message as {
+              message?: {
+                content?: Array<{ type?: string; text?: string; name?: string; input?: unknown }>;
+              };
+            }
+          ).message?.content;
           if (Array.isArray(content)) {
             const text = content
               .filter((block) => block.type === 'text' && block.text)
               .map((block) => block.text)
               .join('');
             if (text) yield { type: 'text', text };
+
+            // Narrate tool calls (e.g. "Reading foo.ts", "Searching emails")
+            // as mid-turn progress, gated the same as task_notification
+            // below — see DELIVER_PROGRESS_EVENTS in poll-loop.ts.
+            for (const block of content) {
+              if (block.type !== 'tool_use' || typeof block.name !== 'string') continue;
+              const description = describeToolUse(block.name, block.input);
+              if (description) yield { type: 'progress', message: description };
+            }
           }
         } else if (message.type === 'result') {
           // `result` text exists only on subtype:"success"; error subtypes

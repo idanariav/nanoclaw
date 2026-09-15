@@ -611,9 +611,11 @@ export async function processQuery(
           midTurnTail = scan.tail;
         }
       } else if (event.type === 'progress') {
-        // Optional visibility into long-running turns (see
-        // DELIVER_PROGRESS_EVENTS above). Chat runs only — task runs stay
-        // one-door (the send_message tool is the only delivery path there).
+        // Optional visibility into long-running turns — tool-call narration
+        // ("Reading foo.ts", "Searching emails…") plus SDK task_notification
+        // system messages (see DELIVER_PROGRESS_EVENTS above). Chat runs
+        // only — task runs stay one-door (the send_message tool is the only
+        // delivery path there).
         if (DELIVER_PROGRESS_EVENTS && !routing.taskRun) {
           await deliverProgressEvent(event.message, routing);
         }

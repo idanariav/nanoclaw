@@ -114,8 +114,9 @@ export const EGRESS_NETWORK =
 export const ONECLI_GATEWAY_CONTAINER =
   process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
 
-// Deliver mid-turn 'progress' provider events (e.g. background task-notification
-// summaries) to the user as a lightweight status message, instead of only
+// Deliver mid-turn 'progress' provider events — per-tool-call narration
+// ("Reading foo.ts", "Searching emails…") plus background task-notification
+// summaries — to the user as a lightweight status message, instead of only
 // logging them container-side. Off by default so existing installs see no
 // change in chat volume; the container reads this via its own env (threaded
 // through composeSessionSpec in container-runner.ts).
