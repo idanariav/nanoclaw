@@ -21,6 +21,7 @@ async function gmailFetch(path: string, init?: { method?: string; body?: unknown
   if (!res.ok) {
     throw new Error(`Gmail API ${path} -> ${res.status} ${res.statusText}: ${await res.text()}`);
   }
+  if (res.status === 204) return undefined;
   return res.json();
 }
 
@@ -126,6 +127,40 @@ export async function listEmails(query: string, maxResults: number): Promise<Raw
       from: header(headers, 'From'),
       subject: header(headers, 'Subject'),
       date: header(headers, 'Date'),
+      snippet: msg.snippet ?? '',
+    });
+  }
+  return summaries;
+}
+
+export interface RawDraftSummary {
+  draftId: string;
+  messageId: string;
+  threadId: string;
+  to: string;
+  subject: string;
+  snippet: string;
+}
+
+/** List drafts, optionally filtered by Gmail search syntax scoped to drafts (e.g. "to:someone@example.com"). */
+export async function listDrafts(query: string, maxResults: number): Promise<RawDraftSummary[]> {
+  const listResult = (await gmailFetch(
+    `/drafts?maxResults=${maxResults}${query ? `&q=${encodeURIComponent(query)}` : ''}`,
+  )) as { drafts?: { id: string; message: { id: string; threadId: string } }[] };
+  const drafts = listResult.drafts ?? [];
+
+  const summaries: RawDraftSummary[] = [];
+  for (const d of drafts) {
+    const msg = (await gmailFetch(
+      `/messages/${d.message.id}?format=metadata&metadataHeaders=To&metadataHeaders=Subject`,
+    )) as GmailMessage;
+    const headers = msg.payload?.headers;
+    summaries.push({
+      draftId: d.id,
+      messageId: d.message.id,
+      threadId: d.message.threadId,
+      to: header(headers, 'To'),
+      subject: header(headers, 'Subject'),
       snippet: msg.snippet ?? '',
     });
   }
@@ -310,4 +345,59 @@ export async function createDraft(opts: {
     body: { message: { raw, ...(threadId ? { threadId } : {}) } },
   })) as { id: string; message: { id: string; threadId: string } };
   return { draftId: created.id, messageId: created.message.id, threadId: created.message.threadId };
+}
+
+/** Existing thread context for a draft, used by updateDraft to preserve threading when the caller doesn't pass a new `emailId` to re-thread under. */
+async function getDraftThreadContext(draftId: string): Promise<{ threadId: string; inReplyTo?: string }> {
+  const draft = (await gmailFetch(`/drafts/${draftId}`)) as { message: { id: string } };
+  const msg = (await gmailFetch(
+    `/messages/${draft.message.id}?format=metadata&metadataHeaders=In-Reply-To`,
+  )) as GmailMessage;
+  return { threadId: msg.threadId, inReplyTo: header(msg.payload?.headers, 'In-Reply-To') || undefined };
+}
+
+/**
+ * Update an existing Gmail draft in place (same draft id) — never sends.
+ * Fully replaces the draft's content and attachment set. Threading is
+ * preserved automatically unless `emailId` is passed to re-thread it under a
+ * different message.
+ */
+export async function updateDraft(opts: {
+  draftId: string;
+  to: string;
+  cc?: string;
+  subject: string;
+  body: string;
+  emailId?: string;
+  attachments?: OutgoingAttachment[];
+}): Promise<DraftResult> {
+  let threadId: string | undefined;
+  let inReplyTo: string | undefined;
+  if (opts.emailId) {
+    const original = await getEmail(opts.emailId);
+    threadId = original.threadId;
+    inReplyTo = original.messageIdHeader || undefined;
+  } else {
+    const existing = await getDraftThreadContext(opts.draftId);
+    threadId = existing.threadId;
+    inReplyTo = existing.inReplyTo;
+  }
+  const raw = buildRawMessage({
+    to: opts.to,
+    cc: opts.cc,
+    subject: opts.subject,
+    body: opts.body,
+    inReplyTo,
+    attachments: opts.attachments,
+  });
+  const updated = (await gmailFetch(`/drafts/${opts.draftId}`, {
+    method: 'PUT',
+    body: { message: { raw, ...(threadId ? { threadId } : {}) } },
+  })) as { id: string; message: { id: string; threadId: string } };
+  return { draftId: updated.id, messageId: updated.message.id, threadId: updated.message.threadId };
+}
+
+/** Permanently delete a draft. Cannot be undone. */
+export async function deleteDraft(draftId: string): Promise<void> {
+  await gmailFetch(`/drafts/${draftId}`, { method: 'DELETE' });
 }

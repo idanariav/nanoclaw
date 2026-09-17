@@ -26,10 +26,13 @@ import {
   addLabel,
   archiveEmail,
   createDraft,
+  deleteDraft,
   getAttachmentBytes,
   getEmail,
+  listDrafts,
   listEmails,
   resolveAttachmentByPartId,
+  updateDraft,
 } from './gmail-client.js';
 import {
   applyFilenameOverride,
@@ -158,26 +161,74 @@ async function handleCreateDraft(req: http.IncomingMessage, res: http.ServerResp
     sendJson(res, 400, { error: 'to, subject, and body are required' });
     return;
   }
-  const attachments = body.attachments?.length
-    ? await Promise.all(
-        body.attachments.map(async (driveFileId) => {
-          const [meta, bytes] = await Promise.all([
-            getDriveFileMetadata(driveFileId),
-            downloadDriveFileBytes(driveFileId),
-          ]);
-          return { filename: meta.name, mimeType: meta.mimeType, bytes };
-        }),
-      )
-    : undefined;
   const result = await createDraft({
     to: deanonymizeText(body.to),
     cc: body.cc ? deanonymizeText(body.cc) : undefined,
     subject: deanonymizeText(body.subject),
     body: deanonymizeText(body.body),
     emailId: body.emailId,
-    attachments,
+    attachments: await resolveDraftAttachments(body.attachments),
   });
   sendJson(res, 200, result);
+}
+
+async function handleListDrafts(url: URL, res: http.ServerResponse): Promise<void> {
+  const q = url.searchParams.get('q') ?? '';
+  const maxResults = Math.min(Number(url.searchParams.get('maxResults') ?? '10') || 10, 50);
+  const drafts = await listDrafts(q, maxResults);
+  sendJson(
+    res,
+    200,
+    drafts.map((d) => ({
+      draftId: d.draftId,
+      threadId: d.threadId,
+      to: anonymizeText(d.to),
+      subject: anonymizeText(d.subject),
+      snippet: anonymizeText(d.snippet),
+    })),
+  );
+}
+
+async function resolveDraftAttachments(
+  attachmentIds: string[] | undefined,
+): Promise<{ filename: string; mimeType: string; bytes: Buffer }[] | undefined> {
+  if (!attachmentIds?.length) return undefined;
+  return Promise.all(
+    attachmentIds.map(async (driveFileId) => {
+      const [meta, bytes] = await Promise.all([getDriveFileMetadata(driveFileId), downloadDriveFileBytes(driveFileId)]);
+      return { filename: meta.name, mimeType: meta.mimeType, bytes };
+    }),
+  );
+}
+
+async function handleUpdateDraft(draftId: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = (await readJsonBody(req)) as {
+    to?: string;
+    cc?: string;
+    subject?: string;
+    body?: string;
+    emailId?: string;
+    attachments?: string[];
+  };
+  if (!body.to || !body.subject || !body.body) {
+    sendJson(res, 400, { error: 'to, subject, and body are required' });
+    return;
+  }
+  const result = await updateDraft({
+    draftId,
+    to: deanonymizeText(body.to),
+    cc: body.cc ? deanonymizeText(body.cc) : undefined,
+    subject: deanonymizeText(body.subject),
+    body: deanonymizeText(body.body),
+    emailId: body.emailId,
+    attachments: await resolveDraftAttachments(body.attachments),
+  });
+  sendJson(res, 200, result);
+}
+
+async function handleDeleteDraft(draftId: string, res: http.ServerResponse): Promise<void> {
+  await deleteDraft(draftId);
+  sendJson(res, 200, { draftId, deleted: true });
 }
 
 async function handleArchive(messageId: string, res: http.ServerResponse): Promise<void> {
@@ -317,8 +368,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/drafts') {
+      await handleListDrafts(url, res);
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/drafts') {
       await handleCreateDraft(req, res);
+      return;
+    }
+
+    const draftMatch = url.pathname.match(/^\/drafts\/([^/]+)$/);
+    if (req.method === 'PUT' && draftMatch) {
+      await handleUpdateDraft(decodeURIComponent(draftMatch[1]), req, res);
+      return;
+    }
+
+    if (req.method === 'DELETE' && draftMatch) {
+      await handleDeleteDraft(decodeURIComponent(draftMatch[1]), res);
       return;
     }
 

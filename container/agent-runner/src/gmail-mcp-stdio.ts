@@ -295,6 +295,128 @@ server.tool(
 );
 
 server.tool(
+  'gmail_list_drafts',
+  'List existing Gmail drafts — recipient/subject/snippet are anonymized like gmail_search_emails, plus the draftId needed for gmail_update_draft and gmail_delete_draft. Use this to find a draft made in an earlier session or turn, since a draft id is otherwise only known from gmail_create_draft\'s own response. Optional `query` uses standard Gmail search syntax (e.g. "to:someone@example.com", "subject:invoice"), scoped to drafts.',
+  {
+    query: z.string().optional().describe('Optional Gmail search query to filter drafts, e.g. "to:someone@example.com"'),
+    maxResults: z.number().optional().describe('Max results to return (default 10, max 50)'),
+  },
+  async (args) => {
+    log(`Listing drafts${args.query ? `: ${args.query}` : ''}`);
+    try {
+      const res = await sanitizerFetch(
+        `/drafts?q=${encodeURIComponent(args.query ?? '')}&maxResults=${args.maxResults ?? 10}`,
+      );
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const drafts = (await res.json()) as unknown[];
+      return { content: [{ type: 'text' as const, text: JSON.stringify(drafts, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gmail_update_draft',
+  'Update an existing Gmail draft in place (same draft id) — replaces its recipients/subject/body/attachments. Never sends anything. Pass `draftId` (from gmail_create_draft or gmail_list_drafts). Threading is preserved automatically unless you pass `emailId` to re-thread it under a different email. `to`, `cc`, `subject`, and `body` may contain anonymization tokens (e.g. [PHONE_1]) — resolved back to their real value before the draft is updated. `attachments` fully replaces the draft\'s current attachment set (omit it to end up with none).',
+  {
+    draftId: z.string().describe('The draft id to update (from gmail_create_draft or gmail_list_drafts)'),
+    to: z.string().describe('Recipient address(es), comma-separated for multiple'),
+    cc: z.string().optional().describe('Cc address(es), comma-separated'),
+    subject: z.string().describe('Subject line (Hebrew supported)'),
+    body: z.string().describe('Plain-text body (Hebrew supported — rendered right-to-left automatically when the body contains Hebrew/Arabic text)'),
+    emailId: z
+      .string()
+      .optional()
+      .describe('Re-thread this draft as a reply under a different email\'s thread; omit to keep its current threading'),
+    attachments: z
+      .array(z.string())
+      .optional()
+      .describe('Drive file ids to attach (from gmail_save_attachment_to_drive, gmail_save_url_to_drive, or gmail_edit_excel_attachment) — replaces the draft\'s current attachments entirely'),
+  },
+  async (args) => {
+    log(`Updating draft ${args.draftId}${args.emailId ? ` (re-threading under ${args.emailId})` : ''}${args.attachments?.length ? ` with ${args.attachments.length} attachment(s)` : ''}`);
+    try {
+      const res = await sanitizerFetch(`/drafts/${encodeURIComponent(args.draftId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: args.to,
+          cc: args.cc,
+          subject: args.subject,
+          body: args.body,
+          emailId: args.emailId,
+          attachments: args.attachments,
+        }),
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gmail_delete_draft',
+  'Permanently delete a Gmail draft — cannot be undone. Use when a draft is no longer needed (e.g. superseded by a new one, or the user decided not to send it).',
+  {
+    draftId: z.string().describe('The draft id to delete (from gmail_create_draft or gmail_list_drafts)'),
+  },
+  async (args) => {
+    log(`Deleting draft ${args.draftId}`);
+    try {
+      const res = await sanitizerFetch(`/drafts/${encodeURIComponent(args.draftId)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
   'gmail_read_excel_attachment',
   'Read an Excel (.xlsx) attachment from an email, or a file already saved to Drive, as structured row/column data. Provide either (emailId + partId) for a fresh attachment, or driveFileId for a previously-saved one. Columns the report\'s owner has marked sensitive (e.g. account numbers, names) come back as numbered tokens like [CELL_1] — same rule as other PII tokens: the same real value always gets the same token, and you can paste a token into gmail_edit_excel_attachment to write that sensitive value back unchanged without ever seeing it. Only files matching a known, pre-configured report template (an exact sheet name + header row match) get this anonymized treatment — an unrecognized file returns an error naming the sheets/headers it found, rather than exposing unreviewed data. From there you have two options: ask the user to add a template for it (durable, keeps future reads anonymized), or — for a genuine one-off file you don\'t expect to see again — ask the user directly (e.g. via ask_user_question) whether you may read it anyway UNREDACTED, and if they say yes, retry the same call with `readUnrecognized: true`. Never set that flag without asking first; the result it returns has `anonymized: false` and no sensitive-column protection at all, so treat any PII in it with care. Row numbers in the result are how you address rows in an edit (edits still require a registered template — reading unrecognized is read-only).',
   {
