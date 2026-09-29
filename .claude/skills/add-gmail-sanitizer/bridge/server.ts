@@ -23,9 +23,10 @@
 import http from 'http';
 
 import { archiveAndLabel, createDraft, getAttachmentBytes, getEmail, listEmails } from './gmail-client.js';
-import { applyFilenameOverride, uploadAttachmentToDrive } from './drive-client.js';
+import { applyFilenameOverride, DriveScopeError, listScopedFolder, uploadAttachmentToDrive } from './drive-client.js';
 import { fetchUrlToBuffer } from './url-fetch.js';
 import { anonymizeHtml, anonymizeText, deanonymizeText } from './anonymize.js';
+import { lookupContact } from './people-client.js';
 import {
   applyEditsToBytes,
   readReportFromBytes,
@@ -168,6 +169,37 @@ async function handleArchiveAndLabel(
   sendJson(res, 200, { messageId, label: body.label, markedRead: true, archived: true });
 }
 
+async function handleCopyDriveFile(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = (await readJsonBody(req)) as { driveFileId?: string; newName?: string };
+  if (!body.driveFileId || !body.newName) {
+    sendJson(res, 400, { error: 'driveFileId and newName are required' });
+    return;
+  }
+  sendJson(res, 200, await copyDriveFile(body.driveFileId, body.newName));
+}
+
+async function handleRenameDriveFile(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = (await readJsonBody(req)) as { driveFileId?: string; newName?: string };
+  if (!body.driveFileId || !body.newName) {
+    sendJson(res, 400, { error: 'driveFileId and newName are required' });
+    return;
+  }
+  sendJson(res, 200, await renameDriveFile(body.driveFileId, body.newName));
+}
+
+async function handleListDriveFolder(res: http.ServerResponse): Promise<void> {
+  sendJson(res, 200, await listScopedFolder());
+}
+
+async function handleContactsLookup(url: URL, res: http.ServerResponse): Promise<void> {
+  const name = url.searchParams.get('name');
+  if (!name) {
+    sendJson(res, 400, { error: 'name is required' });
+    return;
+  }
+  sendJson(res, 200, await lookupContact(name));
+}
+
 /** Maps the excel-reports.ts error types to their HTTP shape. Anything else is rethrown for the top-level catch (502). */
 function sendExcelError(res: http.ServerResponse, err: unknown): void {
   if (err instanceof UnrecognizedReportError) {
@@ -297,6 +329,26 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/drive/folder') {
+      await handleListDriveFolder(res);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/drive/copy') {
+      await handleCopyDriveFile(req, res);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/drive/rename') {
+      await handleRenameDriveFile(req, res);
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/contacts/lookup') {
+      await handleContactsLookup(url, res);
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/excel/read') {
       await handleExcelRead(req, res);
       return;
@@ -315,6 +367,10 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: 'not found' });
   } catch (err) {
+    if (err instanceof DriveScopeError) {
+      sendJson(res, 403, { error: err.message });
+      return;
+    }
     log.error('gmail-sanitizer request failed', { url: req.url, err });
     sendJson(res, 502, { error: err instanceof Error ? err.message : String(err) });
   }

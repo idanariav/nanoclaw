@@ -169,6 +169,108 @@ server.tool(
 );
 
 server.tool(
+  'gmail_list_drive_folder',
+  'List the files inside the Drive folder Jarvis has been granted scoped access to — including files uploaded manually or by other apps, not just ones saved here via gmail_save_attachment_to_drive. Returns each file\'s Drive id, name, mime type, size, last-modified time, and view link. Use the returned id with gmail_read_excel_attachment, gmail_edit_excel_attachment, or gmail_create_draft\'s attachments to work with a file you did not save yourself. Only works if a scoped Drive folder has been configured (GMAIL_SANITIZER_DRIVE_FOLDER_ID) — a clear error is returned otherwise.',
+  {},
+  async () => {
+    log('Listing scoped Drive folder');
+    try {
+      const res = await sanitizerFetch('/drive/folder');
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      const files = (await res.json()) as unknown[];
+      return { content: [{ type: 'text' as const, text: JSON.stringify(files, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gmail_copy_drive_file',
+  'Copy a file in the scoped Drive folder to a new file with a new name (server-side; the original is untouched). Use this to create a new period file from a template, e.g. copy the monthly report template to the new month name, then edit the copy. Returns the new driveFileId, webViewLink and filename.',
+  {
+    driveFileId: z.string().describe('Drive file id (from gmail_list_drive_folder or an earlier save/edit result)'),
+    newName: z.string().describe('Name for the new file (the original extension is kept if you omit it)'),
+  },
+  async ({ driveFileId, newName }) => {
+    log(`Copy Drive file ${driveFileId} -> ${newName}`);
+    try {
+      const res = await sanitizerFetch('/drive/copy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ driveFileId, newName }),
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      return { content: [{ type: 'text' as const, text: JSON.stringify(await res.json(), null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gmail_rename_drive_file',
+  'Rename a file in the scoped Drive folder in place (same id and link). Returns the driveFileId, webViewLink and final filename.',
+  {
+    driveFileId: z.string().describe('Drive file id (from gmail_list_drive_folder or an earlier save/edit result)'),
+    newName: z.string().describe('New name for the file (the original extension is kept if you omit it)'),
+  },
+  async ({ driveFileId, newName }) => {
+    log(`Rename Drive file ${driveFileId} -> ${newName}`);
+    try {
+      const res = await sanitizerFetch('/drive/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ driveFileId, newName }),
+      });
+      if (!res.ok) {
+        return {
+          content: [{ type: 'text' as const, text: `gmail-sanitizer error: ${res.status} ${await res.text()}` }],
+          isError: true,
+        };
+      }
+      return { content: [{ type: 'text' as const, text: JSON.stringify(await res.json(), null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to reach gmail-sanitizer at ${GMAIL_SANITIZER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
   'gmail_archive_and_label',
   'Mark an email as read, archive it (remove from inbox), and apply a label — one action, for cleaning up an email after you\'ve saved what you needed from it. The label is created if it doesn\'t already exist.',
   {
