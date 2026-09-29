@@ -601,7 +601,11 @@ registerResource({
         const mount: AdditionalMountConfig = {
           hostPath,
           containerPath,
-          ...(args.ro || args.readonly ? { readonly: true } : {}),
+          // Explicit boolean, not omitted: validateMount only grants RW when
+          // `mount.readonly === false` exactly — an omitted field reads as
+          // "not requesting RW" and is forced read-only regardless of what
+          // the allowlist's root permits.
+          readonly: Boolean(args.ro || args.readonly),
         };
         const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
         if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
