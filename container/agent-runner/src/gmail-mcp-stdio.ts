@@ -349,11 +349,15 @@ server.tool(
     to: z.string().describe('Recipient address(es), comma-separated for multiple'),
     cc: z.string().optional().describe('Cc address(es), comma-separated'),
     subject: z.string().describe('Subject line (Hebrew supported)'),
-    body: z.string().describe('Plain-text body (Hebrew supported — rendered right-to-left automatically when the body contains Hebrew/Arabic text)'),
+    body: z.string().describe('Plain-text body (may be empty when forwardEmailId is set) (Hebrew supported — rendered right-to-left automatically when the body contains Hebrew/Arabic text)'),
     emailId: z
       .string()
       .optional()
       .describe('The email id to thread this draft as a reply under (from gmail_search_emails or gmail_read_email)'),
+    forwardEmailId: z
+      .string()
+      .optional()
+      .describe('Forward this email: its original HTML (layout, logo, buttons, links, images) is embedded below `body` under a "Forwarded message" header, resolved server-side so you never see it. `body` then becomes an optional note above the forward (may be empty). Prefer this over copying a read email\'s text into `body` whenever the user asks to forward.'),
     attachments: z
       .array(z.string())
       .optional()
@@ -371,6 +375,7 @@ server.tool(
           subject: args.subject,
           body: args.body,
           emailId: args.emailId,
+          forwardEmailId: args.forwardEmailId,
           attachments: args.attachments,
         }),
       });
@@ -439,11 +444,15 @@ server.tool(
     to: z.string().describe('Recipient address(es), comma-separated for multiple'),
     cc: z.string().optional().describe('Cc address(es), comma-separated'),
     subject: z.string().describe('Subject line (Hebrew supported)'),
-    body: z.string().describe('Plain-text body (Hebrew supported — rendered right-to-left automatically when the body contains Hebrew/Arabic text)'),
+    body: z.string().describe('Plain-text body (may be empty when forwardEmailId is set) (Hebrew supported — rendered right-to-left automatically when the body contains Hebrew/Arabic text)'),
     emailId: z
       .string()
       .optional()
       .describe('Re-thread this draft as a reply under a different email\'s thread; omit to keep its current threading'),
+    forwardEmailId: z
+      .string()
+      .optional()
+      .describe('Forward this email: its original HTML (layout, logo, buttons, links, images) is embedded below `body` under a "Forwarded message" header, resolved server-side so you never see it. `body` then becomes an optional note above the forward (may be empty). Prefer this over copying a read email\'s text into `body` whenever the user asks to forward.'),
     attachments: z
       .array(z.string())
       .optional()
@@ -461,6 +470,7 @@ server.tool(
           subject: args.subject,
           body: args.body,
           emailId: args.emailId,
+          forwardEmailId: args.forwardEmailId,
           attachments: args.attachments,
         }),
       });

@@ -51,4 +51,37 @@ describe('buildRawMessage', () => {
     expect(headers).toContain('Content-Type: multipart/mixed');
     expect(body).toBe('<div dir="rtl" style="text-align:right">שלום</div>');
   });
+
+  it('embeds the original HTML verbatim under a forwarded-message header, after the note', () => {
+    const original = '<table><tr><td><a href="https://x.test/r">הורדה</a></td></tr></table>';
+    const raw = buildRawMessage({
+      to: 'a@example.com',
+      subject: 'Fwd: x',
+      body: 'שלום',
+      forwarded: {
+        from: 'S <s@x.test>',
+        to: 'me@x.test',
+        subject: 'קבלה',
+        date: 'Mon, 5 Oct 2026',
+        bodyHtml: original,
+        bodyText: 'קבלה',
+      },
+    });
+    const { body } = decode(raw);
+    expect(body.indexOf('שלום')).toBeLessThan(body.indexOf('Forwarded message'));
+    expect(body).toContain('From: S &lt;s@x.test&gt;');
+    expect(body).toContain(original);
+  });
+
+  it('forwards with no note when body is empty', () => {
+    const raw = buildRawMessage({
+      to: 'a@example.com',
+      subject: 'Fwd: x',
+      body: '',
+      forwarded: { from: 'f', to: 't', subject: 's', date: 'd', bodyHtml: '', bodyText: 'plain <b>' },
+    });
+    const { body } = decode(raw);
+    expect(body.startsWith('<div class="gmail_quote"')).toBe(true);
+    expect(body).toContain('plain &lt;b&gt;');
+  });
 });

@@ -1,8 +1,10 @@
 /**
- * Loads bank/credit-card login credentials from data/bank-sync-credentials.json
- * (git-ignored — data/ is fully ignored repo-wide) — the ONLY place these
- * secrets live. No agent container mounts this file, and the MCP tools this
- * service exposes never echo a credential value back.
+ * Loads the configured bank/credit-card accounts (id + companyId) from
+ * data/bank-sync-credentials.json (git-ignored — data/ is fully ignored
+ * repo-wide). The login secrets themselves live in Bitwarden Secrets Manager
+ * and are fetched at scrape time (see bws.ts); an entry may still carry inline
+ * `credentials`, which take precedence. No agent container mounts this file,
+ * and the MCP tools this service exposes never echo a credential value back.
  *
  * Same fail-safe convention as gmail-sanitizer's excel-reports.ts
  * (loadReportTemplates): a missing file, invalid JSON, or a malformed entry
@@ -23,7 +25,7 @@ const VALID_COMPANY_IDS = new Set<string>(Object.values(CompanyTypes));
 export interface BankSyncAccount {
   id: string;
   companyId: CompanyTypes;
-  credentials: ScraperCredentials;
+  credentials?: ScraperCredentials;
 }
 
 function isValidAccount(raw: unknown): raw is BankSyncAccount {
@@ -31,7 +33,7 @@ function isValidAccount(raw: unknown): raw is BankSyncAccount {
   const r = raw as Record<string, unknown>;
   if (typeof r.id !== 'string' || !r.id) return false;
   if (typeof r.companyId !== 'string' || !VALID_COMPANY_IDS.has(r.companyId)) return false;
-  if (typeof r.credentials !== 'object' || r.credentials === null) return false;
+  if (r.credentials !== undefined && (typeof r.credentials !== 'object' || r.credentials === null)) return false;
   return true;
 }
 
@@ -40,7 +42,8 @@ export function loadBankSyncAccounts(configPath: string = CREDENTIALS_PATH): Ban
   let raw: string;
   try {
     raw = fs.readFileSync(configPath, 'utf-8');
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') log.error('bank-sync: cannot read bank-sync-credentials.json', { err });
     return []; // no config yet — nothing configured until data/bank-sync-credentials.json exists
   }
 

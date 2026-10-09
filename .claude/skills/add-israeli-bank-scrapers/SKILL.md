@@ -5,7 +5,7 @@ description: Give an agent group the ability to pull recent transactions from Is
 
 # Add Israeli Bank Scrapers
 
-`bank-sync` is a host-side HTTP service (its own launchd/systemd unit, independent of the main NanoClaw process) that holds bank/credit-card login credentials and drives [israeli-bank-scrapers](https://github.com/eshaham/israeli-bank-scrapers) to fetch this-and-last-month's transactions. The credentials live only in `data/bank-sync-credentials.json` (git-ignored — `data/` is fully ignored repo-wide) on the host; no agent container mounts that file, and no route this service exposes ever echoes a credential value back — only account ids/company names and scraped transactions (date, amount, currency, description).
+`bank-sync` is a host-side HTTP service (its own launchd/systemd unit, independent of the main NanoClaw process) that holds bank/credit-card login credentials and drives [israeli-bank-scrapers](https://github.com/eshaham/israeli-bank-scrapers) to fetch this-and-last-month's transactions. The credentials live in Bitwarden Secrets Manager and are fetched per scrape using a machine-account token kept in the macOS Keychain; `data/bank-sync-credentials.json` (git-ignored) holds only account ids/company types. No agent container mounts that file, and no route this service exposes ever echoes a credential value back — only account ids/company names and scraped transactions (date, amount, currency, description).
 
 **No OTP/2FA handling.** As of `israeli-bank-scrapers@6.10.0`, the library's `otpCodeRetriever`/`getLongTermTwoFactorToken` hooks exist only for the `oneZero` scraper — none of hapoalim/yahav/max/visaCal/isracard's credential types carry an OTP field, and there's no way to relay a live code through for them. If a real login hits a 2FA/device-verification wall on the bank's site, that account's scrape just comes back with `status: "error"` — there's nothing to resume. Each account gets its own persistent Chromium profile dir (`data/bank-sync-profiles/<accountId>/`) as a best-effort way to reduce the odds of hitting such a wall (a returning browser profile is sometimes recognized by the bank's own site), but this isn't guaranteed.
 
@@ -63,19 +63,26 @@ Expect `bank_sync_accounts`, `bank_sync_start`, `bank_sync_status` (plus any loc
 
 ## Phase 3: Configure accounts
 
-Create `data/bank-sync-credentials.json` (git-ignored — never commit it) with the operator's real values filled in **directly in that file** — never paste credentials into the chat:
+Logins live in **Bitwarden Secrets Manager**, not on disk. The service fetches them at scrape time and holds them in memory only.
+
+1. Install the `bws` CLI (no Homebrew formula; download from the `bitwarden/sdk-sm` GitHub releases, verify the SHA-256, put it at `~/.local/bin/bws` or set `BANK_SYNC_BWS_PATH`).
+2. In Bitwarden: create a project (e.g. `bank-sync`), one secret per account — **key = the account id below, value = the credentials as a JSON object** — and a machine account with read access to that project only. Enter values in the web UI, never in chat.
+3. Store the machine-account access token in the Keychain (prompts for the value): `security add-generic-password -s bank-sync-bws -a bank-sync -w`
+4. Create `data/bank-sync-credentials.json` (git-ignored) listing only ids and company types:
 
 ```json
 {
   "accounts": [
-    { "id": "yahav-1", "companyId": "yahav", "credentials": { "username": "", "password": "", "nationalID": "" } },
-    { "id": "hapoalim-1", "companyId": "hapoalim", "credentials": { "userCode": "", "password": "" } },
-    { "id": "cal-1", "companyId": "visaCal", "credentials": { "username": "", "password": "" } },
-    { "id": "max-1", "companyId": "max", "credentials": { "username": "", "password": "" } },
-    { "id": "isracard-1", "companyId": "isracard", "credentials": { "id": "", "card6Digits": "", "password": "" } }
+    { "id": "yahav-1", "companyId": "yahav" },
+    { "id": "hapoalim-1", "companyId": "hapoalim" },
+    { "id": "cal-1", "companyId": "visaCal" },
+    { "id": "max-1", "companyId": "max" },
+    { "id": "isracard-1", "companyId": "isracard" }
   ]
 }
 ```
+
+Secret value shapes: yahav `{"username","password","nationalID"}`, hapoalim `{"userCode","password"}`, visaCal/max `{"username","password"}`, isracard `{"id","card6Digits","password"}`. (An inline `credentials` object on an account entry still works and takes precedence, but defeats the purpose.)
 
 Only include the accounts the operator actually has. Supported `companyId` values used by this walkthrough: `yahav`, `hapoalim`, `visaCal` (Cal), `max`, `isracard` (see `israeli-bank-scrapers`'s `CompanyTypes` export for the full list it supports beyond these).
 

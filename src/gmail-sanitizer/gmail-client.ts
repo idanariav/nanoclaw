@@ -266,6 +266,28 @@ function textToHtmlBody(text: string): string {
   return `<div dir="${dir}" style="text-align:${dir === 'rtl' ? 'right' : 'left'}">${html}</div>`;
 }
 
+export interface ForwardedMessage {
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  bodyHtml: string;
+  bodyText: string;
+}
+
+/** Gmail-style "Forwarded message" block wrapping the original's HTML untouched, so its layout, links and images survive. */
+function forwardedHtml(f: ForwardedMessage): string {
+  const dir = RTL_CHAR_RE.test(f.bodyText + f.subject) ? 'rtl' : 'ltr';
+  const original = f.bodyHtml || `<div>${escapeHtml(f.bodyText).replace(/\r\n|\r|\n/g, '<br>')}</div>`;
+  const line = (label: string, value: string) => (value ? `${label}: ${escapeHtml(value)}<br>` : '');
+  return (
+    `<div class="gmail_quote" dir="${dir}">` +
+    `<div style="text-align:${dir === 'rtl' ? 'right' : 'left'}">---------- Forwarded message ---------<br>` +
+    `${line('From', f.from)}${line('Date', f.date)}${line('Subject', f.subject)}${line('To', f.to)}</div><br>` +
+    `${original}</div>`
+  );
+}
+
 /** Exported for unit testing — pure function, no network I/O. */
 export function buildRawMessage(opts: {
   to: string;
@@ -274,7 +296,11 @@ export function buildRawMessage(opts: {
   body: string;
   inReplyTo?: string;
   attachments?: OutgoingAttachment[];
+  forwarded?: ForwardedMessage;
 }): string {
+  const htmlBody =
+    (opts.body ? textToHtmlBody(opts.body) + (opts.forwarded ? '<br>' : '') : '') +
+    (opts.forwarded ? forwardedHtml(opts.forwarded) : '');
   const headers = [
     `To: ${opts.to}`,
     ...(opts.cc ? [`Cc: ${opts.cc}`] : []),
@@ -287,7 +313,7 @@ export function buildRawMessage(opts: {
 
   if (!opts.attachments || opts.attachments.length === 0) {
     headers.push('Content-Type: text/html; charset="UTF-8"', 'Content-Transfer-Encoding: base64');
-    const encodedBody = encodeBase64Body(Buffer.from(textToHtmlBody(opts.body), 'utf8'));
+    const encodedBody = encodeBase64Body(Buffer.from(htmlBody, 'utf8'));
     const message = `${headers.join('\r\n')}\r\n\r\n${encodedBody}`;
     return Buffer.from(message, 'utf8').toString('base64url');
   }
@@ -295,7 +321,7 @@ export function buildRawMessage(opts: {
   const boundary = `nanoclaw-draft-${Date.now()}`;
   headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
   const parts = [
-    `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBase64Body(Buffer.from(textToHtmlBody(opts.body), 'utf8'))}`,
+    `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBase64Body(Buffer.from(htmlBody, 'utf8'))}`,
     ...opts.attachments.map(
       (a) =>
         `--${boundary}\r\nContent-Type: ${a.mimeType}\r\nContent-Disposition: attachment; filename="${a.filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBase64Body(a.bytes)}`,
@@ -323,6 +349,7 @@ export async function createDraft(opts: {
   subject: string;
   body: string;
   emailId?: string;
+  forwardEmailId?: string;
   attachments?: OutgoingAttachment[];
 }): Promise<DraftResult> {
   let threadId: string | undefined;
@@ -339,6 +366,7 @@ export async function createDraft(opts: {
     body: opts.body,
     inReplyTo,
     attachments: opts.attachments,
+    forwarded: opts.forwardEmailId ? await getEmail(opts.forwardEmailId) : undefined,
   });
   const created = (await gmailFetch('/drafts', {
     method: 'POST',
@@ -369,6 +397,7 @@ export async function updateDraft(opts: {
   subject: string;
   body: string;
   emailId?: string;
+  forwardEmailId?: string;
   attachments?: OutgoingAttachment[];
 }): Promise<DraftResult> {
   let threadId: string | undefined;
@@ -389,6 +418,7 @@ export async function updateDraft(opts: {
     body: opts.body,
     inReplyTo,
     attachments: opts.attachments,
+    forwarded: opts.forwardEmailId ? await getEmail(opts.forwardEmailId) : undefined,
   });
   const updated = (await gmailFetch(`/drafts/${opts.draftId}`, {
     method: 'PUT',

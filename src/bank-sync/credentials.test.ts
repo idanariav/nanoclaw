@@ -38,13 +38,14 @@ describe('loadBankSyncAccounts', () => {
           { id: 'missing-company', credentials: { username: 'u', password: 'p' } },
           { id: 'bad-company', companyId: 'notARealCompany', credentials: { username: 'u', password: 'p' } },
           { companyId: 'max', credentials: { username: 'u', password: 'p' } },
-          { id: 'no-credentials', companyId: 'max' },
+          { id: 'bad-credentials', companyId: 'max', credentials: 'nope' },
+          { id: 'bws-only', companyId: 'max' },
           { id: 'max-1', companyId: 'max', credentials: { username: 'u', password: 'p' } },
         ],
       }),
     );
     const accounts = loadBankSyncAccounts(file);
-    expect(accounts.map((a) => a.id)).toEqual(['yahav-1', 'max-1']);
+    expect(accounts.map((a) => a.id)).toEqual(['yahav-1', 'bws-only', 'max-1']);
   });
 
   it('accountSummaries never includes credentials', () => {

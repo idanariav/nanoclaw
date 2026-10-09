@@ -160,9 +160,10 @@ async function handleCreateDraft(req: http.IncomingMessage, res: http.ServerResp
     subject?: string;
     body?: string;
     emailId?: string;
+    forwardEmailId?: string;
     attachments?: string[];
   };
-  if (!body.to || !body.subject || !body.body) {
+  if (!body.to || !body.subject || (!body.body && !body.forwardEmailId)) {
     sendJson(res, 400, { error: 'to, subject, and body are required' });
     return;
   }
@@ -170,8 +171,9 @@ async function handleCreateDraft(req: http.IncomingMessage, res: http.ServerResp
     to: deanonymizeText(body.to),
     cc: body.cc ? deanonymizeText(body.cc) : undefined,
     subject: deanonymizeText(body.subject),
-    body: deanonymizeText(body.body),
+    body: deanonymizeText(body.body ?? ''),
     emailId: body.emailId,
+    forwardEmailId: body.forwardEmailId,
     attachments: await resolveDraftAttachments(body.attachments),
   });
   sendJson(res, 200, result);
@@ -213,9 +215,10 @@ async function handleUpdateDraft(draftId: string, req: http.IncomingMessage, res
     subject?: string;
     body?: string;
     emailId?: string;
+    forwardEmailId?: string;
     attachments?: string[];
   };
-  if (!body.to || !body.subject || !body.body) {
+  if (!body.to || !body.subject || (!body.body && !body.forwardEmailId)) {
     sendJson(res, 400, { error: 'to, subject, and body are required' });
     return;
   }
@@ -224,8 +227,9 @@ async function handleUpdateDraft(draftId: string, req: http.IncomingMessage, res
     to: deanonymizeText(body.to),
     cc: body.cc ? deanonymizeText(body.cc) : undefined,
     subject: deanonymizeText(body.subject),
-    body: deanonymizeText(body.body),
+    body: deanonymizeText(body.body ?? ''),
     emailId: body.emailId,
+    forwardEmailId: body.forwardEmailId,
     attachments: await resolveDraftAttachments(body.attachments),
   });
   sendJson(res, 200, result);

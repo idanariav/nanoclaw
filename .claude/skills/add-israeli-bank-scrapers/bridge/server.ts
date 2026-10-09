@@ -4,12 +4,13 @@
  * host process and of any agent group's container. Binds to localhost only;
  * containers reach it via host.docker.internal.
  *
- * Bank/credit-card login credentials (data/bank-sync-credentials.json) never
- * leave this process — no route here echoes a credential value back, only
+ * Bank/credit-card login credentials (fetched from Bitwarden Secrets Manager
+ * per scrape) never leave this process — no route here echoes a credential value back, only
  * account ids/companyIds and the scraped transactions themselves.
  */
 import http from 'http';
 
+import { fetchBankCredentials } from './bws.js';
 import { accountSummaries, loadBankSyncAccounts } from './credentials.js';
 import { createJob, getJob } from './jobs.js';
 import { runJobAccounts } from './scraper-runner.js';
@@ -57,10 +58,25 @@ async function handleStartScrape(req: http.IncomingMessage, res: http.ServerResp
     return;
   }
 
+  let withCreds: typeof selected;
+  try {
+    const secrets = await fetchBankCredentials();
+    withCreds = selected.map((a) => ({ ...a, credentials: a.credentials ?? secrets.get(a.id) }));
+  } catch (err) {
+    log.error('bank-sync: fetching credentials from Bitwarden failed', { err });
+    sendJson(res, 502, { error: 'Could not fetch credentials from Bitwarden Secrets Manager (see service log).' });
+    return;
+  }
+  const missing = withCreds.filter((a) => !a.credentials).map((a) => a.id);
+  if (missing.length) {
+    sendJson(res, 400, { error: `No Bitwarden secret found for account(s): ${missing.join(', ')}` });
+    return;
+  }
+
   const job = createJob(selected.map(({ id, companyId }) => ({ id, companyId })));
   // Fire-and-forget: the HTTP response returns the runId immediately; the
   // caller polls /scrape/status/:runId while scraping runs in the background.
-  runJobAccounts(job.runId, selected).catch((err) => {
+  runJobAccounts(job.runId, withCreds).catch((err) => {
     log.error('bank-sync: job run failed unexpectedly', { runId: job.runId, err });
   });
   sendJson(res, 200, { runId: job.runId });

@@ -1,7 +1,3 @@
-onlyBuiltDependencies:
-  - esbuild
-  - protobufjs
-  - sharp
 
 # Top-level, NOT nested under a `pnpm:` key: pnpm reads a `pnpm:` config block
 # only from package.json. Nested here in pnpm-workspace.yaml the setting is
@@ -10,3 +6,8 @@ onlyBuiltDependencies:
 # a no-op. New package versions must exist on the registry this many minutes
 # (4320 = 3 days) before pnpm will resolve them.
 minimumReleaseAge: 4320
+onlyBuiltDependencies:
+  - esbuild
+  - protobufjs
+  - puppeteer
+  - sharp
